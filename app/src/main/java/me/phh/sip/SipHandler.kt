@@ -750,10 +750,12 @@ class SipHandler(val ctxt: Context) {
                 "to" to call.callHeaders["from"]!!,
             )
         }
-        val routeSet = call.callHeaders["record-route"]?.let { rr ->
-            // Single Record-Route on O2/S9; keep order for UAS side. Multiple values may need
-            // stricter RFC 3261 UAS/UAC ordering later, but this is already much better than
-            // copying the INVITE Via/From/To/CSeq into BYE.
+        val routeSet = call.callHeaders["route"]?.let { route ->
+            // Confirmed outgoing dialogs store their route set as Route after the final 200 OK.
+            mapOf("route" to route)
+        } ?: call.callHeaders["record-route"]?.let { rr ->
+            // Incoming dialogs still keep the original Record-Route from the INVITE. For the
+            // single-route O2/S9 case we can use it directly as Route for local in-dialog requests.
             mapOf("route" to rr)
         } ?: emptyMap()
         return base + directionHeaders + routeSet + mapOf("call-id" to call.callHeaders["call-id"]!!) +
@@ -1495,11 +1497,24 @@ a=sendrecv
                     // Update dialog route set from the confirmed 200 OK (RFC 3261 §12.1.2)
                     // so that subsequent in-dialog requests (BYE, UPDATE) use the correct route.
                     val rrFrom200Ok = resp.headers["record-route"]
-                    if (rrFrom200Ok != null) {
-                        currentCall = currentCall?.copy(
-                            callHeaders = currentCall!!.callHeaders + ("route" to rrFrom200Ok)
+                    val remoteTargetFrom200Ok = resp.headers["contact"]?.getOrNull(0)
+                        ?.let { extractDestinationFromContact(it) }
+                    currentCall = currentCall?.let { confirmedCall ->
+                        var confirmedHeaders = confirmedCall.callHeaders
+                        if (rrFrom200Ok != null) {
+                            confirmedHeaders = confirmedHeaders + ("record-route" to rrFrom200Ok) + ("route" to rrFrom200Ok)
+                        }
+                        // INVITE uses its original CSeq for ACK. If we sent PRACK, the next local
+                        // in-dialog request must be INVITE CSeq + 2, otherwise INVITE CSeq + 1.
+                        val nextDialogCseq = cseq + if (rseqHandled) 2 else 1
+                        val keptCseq = maxOf(confirmedCall.localCseq.get(), nextDialogCseq)
+                        confirmedCall.copy(
+                            callHeaders = confirmedHeaders,
+                            remoteContact = remoteTargetFrom200Ok ?: confirmedCall.remoteContact,
+                            localCseq = AtomicInteger(keptCseq),
                         )
                     }
+                    Rlog.d(TAG, "Outgoing confirmed dialog: remoteTarget=${currentCall?.remoteContact} nextLocalCseq=${currentCall?.localCseq?.get()} route=${currentCall?.callHeaders?.get("route")}")
                     Rlog.d(TAG, "Invite got SUCCESS")
                     onOutgoingCallConnected?.invoke(Object(), emptyMap())
                 } else {
@@ -1533,21 +1548,30 @@ a=sendrecv
                 }
                 val rtpRemotePort = sdpElement("m")!!.split(" ")[1]
                 val rtpRemoteAddr = InetAddress.getByName(sdpElement("c")!!.split(" ")[2])
+                val inviteCseqForDialog = resp.headers["cseq"]!![0].substringBefore(" ").toIntOrNull() ?: 1
+                val nextLocalCseqForDialog = inviteCseqForDialog + if (rseqHandled) 2 else 1
                 currentCall = Call(
                     outgoing = true,
                     amrTrack = amrTrack,
                     amrTrackDesc = amrTrackDesc,
                     dtmfTrack = dtmfTrack,
                     dtmfTrackDesc = dtmfTrackDesc,
-                    // Update from/to/call-id based on the response we got to include the remote tag
-                    callHeaders = myHeaders - "require" - "content-type" + ("from" to resp.headers["from"]!!) + ("to" to resp.headers["to"]!!) + ("call-id" to resp.headers["call-id"]!!),
+                    // Update from/to/call-id based on the response we got to include the remote tag.
+                    // Keep the response Record-Route too; later local BYE/UPDATE must use it as Route.
+                    callHeaders = myHeaders - "require" - "content-type" +
+                        ("from" to resp.headers["from"]!!) +
+                        ("to" to resp.headers["to"]!!) +
+                        ("call-id" to resp.headers["call-id"]!!) +
+                        (resp.headers["record-route"]?.let { mapOf("record-route" to it, "route" to it) } ?: emptyMap()),
                     rtpRemoteAddr = rtpRemoteAddr,
                     rtpRemotePort = rtpRemotePort.toInt(),
                     rtpSocket = rtpSocket,
                     sdp = resp.body,
                     hasEarlyMedia = resp.headers["p-early-media"]?.isNotEmpty() == true,
                     remoteContact = extractDestinationFromContact(resp.headers["contact"]!![0]),
+                    localCseq = AtomicInteger(nextLocalCseqForDialog),
                 )
+                Rlog.d(TAG, "Outgoing early dialog: remoteTarget=${currentCall?.remoteContact} nextLocalCseq=${currentCall?.localCseq?.get()} route=${currentCall?.callHeaders?.get("route")}")
 
                 // This isn't the answer to our INVITE, but to our later precondition UPDATE
                 // TODO Actually check cseq
