@@ -242,13 +242,28 @@ class SipHandler(val ctxt: Context) {
         var status = 200
         // XXX default requestCb = notification?
         if (requestCb != null) {
-            status = requestCb(msg)
+            status = try {
+                requestCb(msg)
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Request handler for ${msg.method} crashed; replying 500 and keeping SIP transport alive", t)
+                500
+            }
         }
         if(status == 0) return true
         val reply =
             SipResponse(
                 statusCode = status,
-                statusString = if (status == 200) "OK" else if (status == 100) "Trying" else "ERROR",
+                statusString = when (status) {
+                    100 -> "Trying"
+                    200 -> "OK"
+                    481 -> "Call/Transaction Does Not Exist"
+                    486 -> "Busy Here"
+                    487 -> "Request Terminated"
+                    488 -> "Not Acceptable Here"
+                    500 -> "Server Internal Error"
+                    603 -> "Decline"
+                    else -> "ERROR"
+                },
                 headersParam =
                     msg.headers.filter { (k, _) ->
                         k in listOf("cseq", "via", "from", "to", "call-id")
@@ -630,7 +645,8 @@ class SipHandler(val ctxt: Context) {
                     client.close()
                 }
             } catch(t: Throwable) {
-                Rlog.d(TAG, "Got exception in TCP server socket", t)
+                Rlog.w(TAG, "Got exception in TCP server socket, reconnecting", t)
+                reconnectIms("TCP server SIP socket lost")
             }
         }
         CoroutineScope(Dispatchers.IO).launch {
@@ -1013,7 +1029,14 @@ class SipHandler(val ctxt: Context) {
     }
 
     fun handleUpdate(request: SipRequest): Int {
-        val call = currentCall!!
+        val requestCallId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
+        val call = currentCall
+        val currentCallId = call?.callHeaders?.get("call-id")?.getOrNull(0)
+        if (call == null || currentCallId != requestCallId) {
+            Rlog.w(TAG, "Rejecting UPDATE for non-current dialog: callId=$requestCallId cseq=$requestCseq current=$currentCallId")
+            return 481
+        }
         val ipType = if(call.rtpRemoteAddr is Inet6Address) "IP6" else "IP4"
         val allTracks = listOf(call.amrTrack, call.dtmfTrack).sorted()
         val mySdp = """
