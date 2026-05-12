@@ -39,6 +39,8 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
     val imsSms = PhhImsSms(slotId)
     lateinit var sipHandler: SipHandler
+    private var outgoingCallListener: ImsCallSessionListener? = null
+    private var outgoingCallActive = false
     fun getSipHandlerOrNull(): SipHandler? = if (this::sipHandler.isInitialized) sipHandler else null
 
     override fun initialize(context: Context?, slotId: Int) {
@@ -98,6 +100,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
             override fun start(callee: String, profile: ImsCallProfile) {
                 Rlog.d(TAG, "Starting call with $callee profile $profile")
+                outgoingCallActive = true
                 sipHandler.call(callee)
             }
 
@@ -108,6 +111,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
             override fun setListener(listener: ImsCallSessionListener) {
                 Rlog.d(TAG, "Setting CallListener to $listener")
                 mListener = listener
+                outgoingCallListener = listener
             }
 
             override fun reject(reason: Int) {
@@ -119,6 +123,10 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
                 sipHandler.myHandler.post {
                     sipHandler.terminateCall()
                     mListener.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED, 0, "Kikoo"))
+                    outgoingCallActive = false
+                    if (outgoingCallListener == mListener) {
+                        outgoingCallListener = null
+                    }
                 }
             }
         }.also { session ->
@@ -266,22 +274,24 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
             }, Bundle())
         }
-        sipHandler.onCancelledCall = { param: Object, s: String, map: Map<String, String> ->
-            Rlog.d(TAG, "Cancelling call")
-            val statusCode = map["statusCode"]?.toInt() ?: -1
-            if (statusCode >= 400) {
-                val statusMessage = map["statusString"] ?: "Kikoo"
-                callListener?.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage))
-            } else {
-                callListener?.callSessionTerminated(
-                    ImsReasonInfo(
-                        ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE,
-                        0,
-                        "Kikoo"
-                    )
-                )
-            }
-        }
+        sipHandler.onCancelledCall = { param: Object, reason: String, map: Map<String, String> ->
+    Rlog.d(TAG, "Cancelling call")
+    val statusCode = map["statusCode"]?.toInt() ?: -1
+    val reasonInfo = if (statusCode >= 400) {
+        val statusMessage = map["statusString"] ?: "Kikoo"
+        ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage)
+    } else {
+        ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE, 0, "Kikoo")
+    }
+
+    if (outgoingCallActive) {
+        outgoingCallListener?.callSessionTerminated(reasonInfo)
+        outgoingCallActive = false
+        outgoingCallListener = null
+    } else {
+        callListener?.callSessionTerminated(reasonInfo)
+    }
+}
         sipHandler.getVolteNetwork()
     }
 
