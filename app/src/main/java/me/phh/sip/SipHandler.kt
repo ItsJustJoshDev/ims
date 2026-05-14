@@ -214,28 +214,7 @@ class SipHandler(val ctxt: Context) {
         remotePort: Int,
         label: String,
     ): Boolean {
-        return try {
-            val packet = if (rtpSocket.isConnected) {
-                // A connected DatagramSocket must be sent without an explicit packet
-                // address on Android; otherwise libcore can throw
-                // "connected address and packet address differ" even when the
-                // dialog was only re-targeted by SDP/UPDATE during the call.
-                DatagramPacket(bytes, bytes.size)
-            } else {
-                DatagramPacket(bytes, bytes.size, remoteAddr, remotePort)
-            }
-            rtpSocket.send(packet)
-            true
-        } catch (t: Throwable) {
-            Rlog.e(
-                TAG,
-                "Failed to send $label: connected=${rtpSocket.isConnected} " +
-                    "socketRemote=${rtpSocket.inetAddress}:${rtpSocket.port} " +
-                    "packetRemote=$remoteAddr:$remotePort",
-                t
-            )
-            false
-        }
+        return RtpPacketSender.send(TAG, rtpSocket, bytes, remoteAddr, remotePort, label)
     }
 
 fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
