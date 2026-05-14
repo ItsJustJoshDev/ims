@@ -1298,6 +1298,24 @@ a=sendrecv
         return 0
     }
 
+    private fun remoteEndExtras(
+        callId: String,
+        terminatedCall: Call?,
+        isBye: Boolean,
+    ): Map<String, String> {
+        if (isBye && terminatedCall?.outgoing == true && terminatedCall.outgoingConnectedNotified.get() == false) {
+            Rlog.w(TAG, "Remote ended outgoing call before any RTP/media arrived; reporting as network rejection callId=$callId")
+            return mapOf(
+                "call-id" to callId,
+                "statusCode" to "480",
+                "statusString" to "No post-answer RTP before BYE",
+                "remoteNoMediaRelease" to "true",
+            )
+        }
+
+        return mapOf("call-id" to callId)
+    }
+
     fun handleCancel(request: SipRequest): Int {
         val callId = request.callIdOrEmpty()
         val isCancel = request.method == SipMethod.CANCEL
@@ -1397,12 +1415,7 @@ a=sendrecv
         val terminatedCall = currentCall
         currentCall = null
         clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = "remote ${request.method}")
-        val cancelExtras = if (isBye && terminatedCall?.outgoing == true && terminatedCall.outgoingConnectedNotified.get() == false) {
-            Rlog.w(TAG, "Remote ended outgoing call before any RTP/media arrived; reporting as network rejection callId=$callId")
-            mapOf("call-id" to callId, "statusCode" to "480", "statusString" to "No post-answer RTP before BYE", "remoteNoMediaRelease" to "true")
-        } else {
-            mapOf("call-id" to callId)
-        }
+        val cancelExtras = remoteEndExtras(callId, terminatedCall, isBye)
         onCancelledCall?.invoke(Object(), "", cancelExtras)
         return 200
     }
