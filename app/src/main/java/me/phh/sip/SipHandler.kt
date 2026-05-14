@@ -1669,7 +1669,7 @@ a=sendrecv
         if (!call.outgoing) return
 
         val callId = call.callIdOrEmpty()
-        val activeCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0).orEmpty()
+        val activeCallId = currentCall?.callIdOrEmpty().orEmpty()
 
         if (activeCallId != callId) {
             Rlog.d(TAG, "Not notifying outgoing connected for stale call: callId=$callId active=$activeCallId reason=$reason")
@@ -1815,7 +1815,7 @@ a=sendrecv
                 while (incomingAcceptedAwaitingAck.get() && elapsedMs < 32000L) {
                     Thread.sleep(delayMs)
                     elapsedMs += delayMs
-                    val stillSameCall = currentCall?.callHeaders?.get("call-id")?.getOrNull(0) == acceptedCallId
+                    val stillSameCall = currentCall?.callIdOrNull() == acceptedCallId
                     if (!incomingAcceptedAwaitingAck.get() || !stillSameCall) break
                     Rlog.w(TAG, "Retransmitting incoming 200 OK waiting for ACK callId=$acceptedCallId elapsed=${elapsedMs}ms")
                     if (!writeSipBytes(responseWriter, responseBytes, "incoming INVITE final 200 OK retransmit callId=$acceptedCallId elapsed=${elapsedMs}ms")) {
@@ -1830,7 +1830,7 @@ a=sendrecv
                     Rlog.w(TAG, "Incoming accepted call still has no ACK after ${elapsedMs}ms; clearing pending accepted state callId=$acceptedCallId")
                     incomingAcceptedAwaitingAck.set(false)
                     incomingHangupAfterAck.set(false)
-                    if (currentCall?.callHeaders?.get("call-id")?.getOrNull(0) == acceptedCallId && !callStarted.get()) {
+                    if (currentCall?.callIdOrNull() == acceptedCallId && !callStarted.get()) {
                         callStopped.set(true)
                         callStarted.set(false)
                         threadsStarted.set(false)
@@ -2205,7 +2205,7 @@ a=sendrecv
             setResponseCallback(outgoingInviteCallId) { r: SipResponse ->
                 val responseCallId = r.headers["call-id"]?.getOrNull(0).orEmpty()
                 val responseCseqForLog = r.headers["cseq"]?.getOrNull(0)
-                val activeCallIdForResponse = currentCall?.callHeaders?.get("call-id")?.getOrNull(0)
+                val activeCallIdForResponse = currentCall?.callIdOrNull()
                 val pendingCallIdForResponse = pendingOutgoingInvite?.callId
                 if (responseCallId != outgoingInviteCallId ||
                     (activeCallIdForResponse != responseCallId && pendingCallIdForResponse != responseCallId)) {
@@ -2315,7 +2315,7 @@ a=sendrecv
                     if(resp.statusCode >= 400) {
                         val failedCallId = resp.callIdOrEmpty()
                         val failedCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
-                        val activeCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0)
+                        val activeCallId = currentCall?.callIdOrNull()
                         val pendingCallId = pendingOutgoingInvite?.callId
 
                         if (activeCallId != failedCallId && pendingCallId != failedCallId) {
@@ -3085,7 +3085,7 @@ a=sendrecv
                 remoteContact = extractDestinationFromContact(request.headers["contact"]!![0]),
                 incomingResponseWriter = incomingResponseWriter,
             )
-            val installedIncomingCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0).orEmpty()
+            val installedIncomingCallId = currentCall?.callIdOrEmpty().orEmpty()
             if (wasRecentlyTerminatedIncomingCall(incomingCallId) || installedIncomingCallId != incomingCallId) {
                 Rlog.w(TAG, "Aborting incoming ringing because Call-ID was terminated during setup: callId=$incomingCallId installed=$installedIncomingCallId")
                 if (installedIncomingCallId == incomingCallId) {
