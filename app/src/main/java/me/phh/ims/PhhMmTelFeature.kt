@@ -189,6 +189,26 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         return ImsUtImplBase()
     }
 
+    private fun cancelledReasonInfo(map: Map<*, *>): ImsReasonInfo {
+        val statusCode = (map["statusCode"] as? String)?.toIntOrNull() ?: -1
+        val statusMessage = (map["statusString"] as? String) ?: "Kikoo"
+        val localReject = map["localReject"] == "true"
+        val remoteNoMediaRelease = map["remoteNoMediaRelease"] == "true"
+
+        return when {
+            localReject -> ImsReasonInfo(ImsReasonInfo.CODE_USER_DECLINE, 0, statusMessage)
+
+            remoteNoMediaRelease -> {
+                Rlog.w(TAG, "No-media outgoing release; reporting as remote termination for Dialer UX: $statusMessage")
+                ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE, 0, statusMessage)
+            }
+
+            statusCode >= 400 -> ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage)
+
+            else -> ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE, 0, "Kikoo")
+        }
+    }
+
     override fun onFeatureReady() {
         Rlog.d(TAG, "$slotId onFeatureReady")
         if(this::sipHandler.isInitialized) return
@@ -314,22 +334,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         }
         sipHandler.onCancelledCall = { param: Object, reason: String, map: Map<String, String> ->
     Rlog.d(TAG, "Cancelling call")
-    val statusCode = map["statusCode"]?.toInt() ?: -1
-            val statusMessage = map["statusString"] ?: "Kikoo"
-            val localReject = map["localReject"] == "true"
-            val remoteNoMediaRelease = map["remoteNoMediaRelease"] == "true"
-            val reasonInfo = if (localReject) {
-                ImsReasonInfo(ImsReasonInfo.CODE_USER_DECLINE, 0, statusMessage)
-            } else if (remoteNoMediaRelease) {
-                Rlog.w(TAG, "No-media outgoing release; reporting as remote termination for Dialer UX: $statusMessage")
-                ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE, 0, statusMessage)
-            } else if (statusCode >= 400) {
-                ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage)
-            } else {
-                ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE, 0, "Kikoo")
-            }
-
-    if (outgoingCallActive) {
+        val reasonInfo = cancelledReasonInfo(map) if (outgoingCallActive) {
         outgoingCallListener?.callSessionTerminated(reasonInfo)
         outgoingCallActive = false
         outgoingCallListener = null
