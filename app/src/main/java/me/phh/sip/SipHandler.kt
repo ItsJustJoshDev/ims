@@ -2589,6 +2589,7 @@ a=sendrecv
                     "callId=$incomingCallId cseq=$incomingCseq " +
                     "activeCallId=$activeCallId activeDirection=$activeDirection"
             )
+            rememberTerminatedIncomingCall(incomingCallId, "busy reject")
             return 486
         }
 
@@ -2601,6 +2602,7 @@ a=sendrecv
                     "callId=$incomingCallId cseq=$incomingCseq " +
                     "pendingOutgoingCallId=$pendingOutgoingCallId"
             )
+            rememberTerminatedIncomingCall(incomingCallId, "outgoing pending reject")
             return 486
         }
 
@@ -2814,6 +2816,11 @@ a=sendrecv
                             mapOf("to" to toWithTag) -
                 "route" - "security-verify"
 
+            if (wasRecentlyTerminatedIncomingCall(incomingCallId)) {
+                Rlog.w(TAG, "Aborting incoming call setup because Call-ID was terminated before dialog install: callId=$incomingCallId")
+                try { rtpSocket.close() } catch (t: Throwable) { Rlog.d(TAG, "Closing aborted incoming RTP socket failed", t) }
+                return@thread
+            }
             currentCall = Call(
                 outgoing = false,
                 amrTrack = amrTrack,
@@ -2829,6 +2836,15 @@ a=sendrecv
                 remoteContact = extractDestinationFromContact(request.headers["contact"]!![0]),
                 incomingResponseWriter = incomingResponseWriter,
             )
+            val installedIncomingCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0).orEmpty()
+            if (wasRecentlyTerminatedIncomingCall(incomingCallId) || installedIncomingCallId != incomingCallId) {
+                Rlog.w(TAG, "Aborting incoming ringing because Call-ID was terminated during setup: callId=$incomingCallId installed=$installedIncomingCallId")
+                if (installedIncomingCallId == incomingCallId) {
+                    currentCall = null
+                }
+                try { rtpSocket.close() } catch (t: Throwable) { Rlog.d(TAG, "Closing aborted incoming RTP socket failed", t) }
+                return@thread
+            }
             onIncomingCall?.invoke(Object(), m, mapOf("call-id" to incomingCallId))
 
                         Rlog.d(TAG, "Deferring incoming media threads until final ACK")
