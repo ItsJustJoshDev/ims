@@ -1383,9 +1383,16 @@ a=sendrecv
         }
 
         if (currentCall?.outgoing == false) rememberTerminatedIncomingCall(callId, "remote ${request.method}")
+        val terminatedCall = currentCall
         currentCall = null
         clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = "remote ${request.method}")
-        onCancelledCall?.invoke(Object(), "", mapOf("call-id" to callId))
+        val cancelExtras = if (isBye && terminatedCall?.outgoing == true && terminatedCall.outgoingConnectedNotified.get() == false) {
+            Rlog.w(TAG, "Remote ended outgoing call before any RTP/media arrived; reporting as network rejection callId=$callId")
+            mapOf("call-id" to callId, "statusCode" to "480", "statusString" to "No post-answer RTP before BYE")
+        } else {
+            mapOf("call-id" to callId)
+        }
+        onCancelledCall?.invoke(Object(), "", cancelExtras)
         return 200
     }
 
@@ -1404,8 +1411,7 @@ a=sendrecv
         val remoteContact: String,
         val incomingResponseWriter: OutputStream? = null,
         val localCseq: AtomicInteger = AtomicInteger(2),
-        val localSdpVersion: AtomicInteger = AtomicInteger(2),
-    )
+        val localSdpVersion: AtomicInteger = AtomicInteger(2), val outgoingRtpReceived: AtomicBoolean = AtomicBoolean(false), val outgoingConnectedNotified: AtomicBoolean = AtomicBoolean(false), )
 
     private data class PendingOutgoingInvite(
         val callId: String,
@@ -1635,6 +1641,72 @@ a=sendrecv
 
     var currentCall: Call? = null
     private var pendingOutgoingInvite: PendingOutgoingInvite? = null
+    private fun maybeNotifyOutgoingCallConnected(call: Call, reason: String) {
+        if (!call.outgoing) return
+
+        val callId = call.callHeaders["call-id"]?.getOrNull(0).orEmpty()
+        val activeCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0).orEmpty()
+
+        if (activeCallId != callId) {
+            Rlog.d(TAG, "Not notifying outgoing connected for stale call: callId=$callId active=$activeCallId reason=$reason")
+            return
+        }
+
+        if (!callStarted.get()) {
+            Rlog.d(TAG, "Outgoing RTP seen before final answer; wait before connected notify callId=$callId reason=$reason")
+            return
+        }
+
+        if (!call.outgoingRtpReceived.get()) {
+            Rlog.d(TAG, "Outgoing final answer received but no post-answer remote RTP yet; keeping Android call in dialing state callId=$callId reason=$reason")
+            return
+        }
+
+        if (call.outgoingConnectedNotified.compareAndSet(false, true)) {
+            Rlog.d(TAG, "Outgoing call connected after remote RTP: callId=$callId reason=$reason")
+            onOutgoingCallConnected?.invoke(
+                Object(),
+                mapOf("call-id" to callId, "connectedReason" to reason)
+            )
+        }
+    }
+
+    private fun scheduleOutgoingPostAnswerRtpTimeout(callId: String, timeoutMs: Long = 2_000L) {
+        thread {
+            try {
+                Thread.sleep(timeoutMs)
+                val activeCall = currentCall ?: return@thread
+                val activeCallId = activeCall.callHeaders["call-id"]?.getOrNull(0).orEmpty()
+                if (!activeCall.outgoing || activeCallId != callId) return@thread
+                if (activeCall.outgoingConnectedNotified.get() || activeCall.outgoingRtpReceived.get()) return@thread
+                if (!callStarted.get()) return@thread
+
+                Rlog.w(TAG, "No post-answer RTP within ${timeoutMs}ms for outgoing call; terminating no-media dialog as network reject callId=$callId")
+                callStopped.set(true)
+                callStarted.set(false)
+                threadsStarted.set(false)
+                try {
+                    sendByeForCall(activeCall)
+                } catch (t: Throwable) {
+                    Rlog.w(TAG, "Failed to send BYE for outgoing no-media timeout callId=$callId", t)
+                }
+                currentCall = null
+                clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = "post-answer RTP timeout")
+                onCancelledCall?.invoke(
+                    Object(),
+                    "",
+                    mapOf(
+                        "call-id" to callId,
+                        "statusCode" to "480",
+                        "statusString" to "No post-answer RTP",
+                    )
+                )
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Outgoing post-answer RTP timeout failed callId=$callId", t)
+            }
+        }
+    }
+
     fun acceptCall() {
         thread {
             val call = currentCall
@@ -2189,7 +2261,15 @@ a=sendrecv
                         return@setResponseCallback true
                     } else {
                         clearPendingOutgoingInvite(finalInviteCallId, closeRtpSocket = false, reason = "final INVITE answer without SDP")
-                        onOutgoingCallConnected?.invoke(Object(), emptyMap())
+                        val confirmedOutgoingCall = currentCall
+                    if (confirmedOutgoingCall != null) {
+                        confirmedOutgoingCall.outgoingRtpReceived.set(false)
+                        Rlog.d(TAG, "Final outgoing answer received; clearing early-media RTP gate until post-answer RTP arrives callId=$finalInviteCallId")
+                        scheduleOutgoingPostAnswerRtpTimeout(finalInviteCallId)
+                        maybeNotifyOutgoingCallConnected(confirmedOutgoingCall, "final INVITE answer")
+                    } else {
+                        Rlog.w(TAG, "Final INVITE answer but currentCall is null after ACK callId=$finalInviteCallId")
+                    }
                     }
                 } else {
                     Rlog.d(TAG, "Invite got status ${resp.statusCode} = ${resp.statusString}")
@@ -2448,8 +2528,18 @@ a=sendrecv
                 break
             }
             receivedCount++
-
-                // Check RTP payload type and convert AMR-NB bandwidth-efficient RTP
+            if (receiveCall.outgoing) {
+                if (callStarted.get()) {
+                    receiveCall.outgoingRtpReceived.set(true)
+                    maybeNotifyOutgoingCallConnected(receiveCall, "first post-answer remote RTP")
+                } else {
+                    val earlyCallId = receiveCall.callHeaders["call-id"]?.getOrNull(0).orEmpty()
+                    if (receivedCount == 1) {
+                        Rlog.d(TAG, "Outgoing early-media RTP before final answer; not marking connected callId=$earlyCallId")
+                    }
+                }
+            }
+            // Check RTP payload type and convert AMR-NB bandwidth-efficient RTP
                 // payloads into generic AMR storage frames for MediaCodec.  The old code
                 // only decoded FT=7, which made calls silent whenever the network switched
                 // to a lower AMR mode such as FT=2.
