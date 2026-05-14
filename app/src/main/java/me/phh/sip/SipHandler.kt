@@ -1548,6 +1548,13 @@ a=sendrecv
                 incomingFinalResponseSent.set(true)
             incomingAcceptedAwaitingAck.set(true)
             incomingHangupAfterAck.set(false)
+            if (threadsStarted.compareAndSet(false, true)) {
+                Rlog.d(TAG, "Prewarming incoming media threads after final 200 OK while waiting for ACK")
+                callDecodeThread()
+                callEncodeThread()
+            } else {
+                Rlog.d(TAG, "Incoming media threads already started while accepting call")
+            }
 
             // RFC 3261: 2xx responses to INVITE are end-to-end and must be retransmitted
             // by the UAS core until the matching ACK arrives. This is also useful here as a
@@ -2255,6 +2262,12 @@ a=sendrecv
         val gen = callGeneration.get()
         // Receiving thread
         thread {
+            val audioManager = ctxt.getSystemService(android.media.AudioManager::class.java)
+            val prevDecodeAudioMode = audioManager.mode
+            if (prevDecodeAudioMode != AudioManager.MODE_IN_COMMUNICATION) {
+                Rlog.d(TAG, "Decode thread forcing MODE_IN_COMMUNICATION before AudioTrack: was=$prevDecodeAudioMode")
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            }
             val minBufferSize = AudioTrack.getMinBufferSize(8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val audioTrack = AudioTrack(AudioManager.STREAM_VOICE_CALL, 8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize, AudioTrack.MODE_STREAM)
             audioTrack.play()
