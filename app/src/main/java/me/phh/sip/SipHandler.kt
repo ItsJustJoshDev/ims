@@ -125,24 +125,18 @@ class SipHandler(val ctxt: Context) {
     private val incomingFinalResponseSent = AtomicBoolean(false)
     private val incomingAcceptedAwaitingAck = AtomicBoolean(false)
     private val incomingHangupAfterAck = AtomicBoolean(false)
-    private val recentTerminatedIncomingCalls = java.util.concurrent.ConcurrentHashMap<String, Long>()
-    private val recentTerminatedIncomingTtlMs = 120_000L
+    private val terminatedIncomingCallIds = RecentCallIdCache(
+        tag = TAG,
+        label = "terminated incoming",
+        ttlMs = 120_000L,
+    )
 
     private fun rememberTerminatedIncomingCall(callId: String, reason: String) {
-        if (callId.isBlank()) return
-        recentTerminatedIncomingCalls[callId] = android.os.SystemClock.elapsedRealtime()
-        Rlog.d(TAG, "Remembering terminated incoming Call-ID for duplicate INVITE guard: callId=$callId reason=$reason")
+        terminatedIncomingCallIds.remember(callId, "duplicate INVITE guard: $reason")
     }
 
     private fun wasRecentlyTerminatedIncomingCall(callId: String): Boolean {
-        if (callId.isBlank()) return false
-        val now = android.os.SystemClock.elapsedRealtime()
-        val then = recentTerminatedIncomingCalls[callId] ?: return false
-        if (now - then > recentTerminatedIncomingTtlMs) {
-            recentTerminatedIncomingCalls.remove(callId)
-            return false
-        }
-        return true
+        return terminatedIncomingCallIds.contains(callId)
     }
 
     private val dispatcher = SipDispatcher(TAG)
@@ -328,7 +322,7 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         incomingFinalResponseSent.set(false)
         incomingAcceptedAwaitingAck.set(false)
         incomingHangupAfterAck.set(false)
-        recentTerminatedIncomingCalls.clear()
+        terminatedIncomingCallIds.clear()
         currentCall = null
         clearPendingOutgoingInvite(closeRtpSocket = true, reason = "IMS reconnect")
         callGeneration.incrementAndGet()
