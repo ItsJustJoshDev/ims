@@ -85,6 +85,13 @@ class SipHandler(val ctxt: Context) {
         val callId = randomBytes(12).toHex()
         return mapOf("call-id" to listOf(callId))
     }
+    private fun SipHeadersMap.callIdOrNull(): String? = this["call-id"]?.getOrNull(0)
+    private fun SipHeadersMap.callIdOrEmpty(): String = callIdOrNull().orEmpty()
+    private fun Call.callIdOrNull(): String? = callHeaders.callIdOrNull()
+    private fun Call.callIdOrEmpty(): String = callHeaders.callIdOrEmpty()
+    private fun SipRequest.callIdOrEmpty(): String = headers.callIdOrEmpty()
+    private fun SipResponse.callIdOrEmpty(): String = headers.callIdOrEmpty()
+
     private var registerCounter = 1
     private var registerHeaders =
         """
@@ -1179,7 +1186,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     }
 
     fun handleAck(request: SipRequest): Int {
-        val callId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        val callId = request.callIdOrEmpty()
         val call = currentCall
         val currentCallId = call?.callHeaders?.get("call-id")?.getOrNull(0)
         Rlog.d(TAG, "Received ACK for call-id=$callId current=$currentCallId outgoing=${call?.outgoing}")
@@ -1218,7 +1225,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     }
 
     fun handleUpdate(request: SipRequest): Int {
-        val requestCallId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        val requestCallId = request.callIdOrEmpty()
         val requestCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
         val call = currentCall
         val currentCallId = call?.callHeaders?.get("call-id")?.getOrNull(0)
@@ -1267,7 +1274,7 @@ a=sendrecv
                     Content-Type: application/sdp
                     Supported: 100rel, replaces, timer
                     Require: precondition
-                    Call-ID: ${currentCall!!.callHeaders["call-id"]!![0]}
+                    Call-ID: ${currentCall!!.callIdOrEmpty()}
                 """.toSipHeadersMap(),
                 body = mySdp
             )
@@ -1292,7 +1299,7 @@ a=sendrecv
     }
 
     fun handleCancel(request: SipRequest): Int {
-        val callId = request.headers["call-id"]?.get(0).orEmpty()
+        val callId = request.callIdOrEmpty()
         val isCancel = request.method == SipMethod.CANCEL
         val isBye = request.method == SipMethod.BYE
 
@@ -1648,7 +1655,7 @@ a=sendrecv
     private fun maybeNotifyOutgoingCallConnected(call: Call, reason: String) {
         if (!call.outgoing) return
 
-        val callId = call.callHeaders["call-id"]?.getOrNull(0).orEmpty()
+        val callId = call.callIdOrEmpty()
         val activeCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0).orEmpty()
 
         if (activeCallId != callId) {
@@ -1764,7 +1771,7 @@ a=sendrecv
                     autofill = false
                 )
             val responseWriter = call.incomingResponseWriter ?: socket.gWriter()
-            val acceptedCallId = call.callHeaders["call-id"]?.getOrNull(0).orEmpty()
+            val acceptedCallId = call.callIdOrEmpty()
             val responseBytes = msg3.toByteArray()
             Rlog.d(TAG, "Sending $msg3 via incomingResponseWriter=${call.incomingResponseWriter != null}")
                 if (!writeSipBytes(responseWriter, responseBytes, "incoming INVITE final 200 OK callId=$acceptedCallId")) {
@@ -1859,7 +1866,7 @@ a=sendrecv
                 Rlog.w(TAG, "rejectCall without valid incoming currentCall: $call")
                 return@thread
             }
-            val rejectedCallId = call.callHeaders["call-id"]?.getOrNull(0).orEmpty()
+            val rejectedCallId = call.callIdOrEmpty()
             rememberTerminatedIncomingCall(rejectedCallId, "local reject")
             val myHeaders = call.callHeaders - "rseq" - "require" - "content-type" - "p-access-network-info" +
                 "Content-Length: 0".toSipHeadersMap()
@@ -1980,7 +1987,7 @@ a=sendrecv
         callStopped.set(true)
 
         if (call.outgoing && !callStarted.get()) {
-            if (pendingOutgoing != null && pendingOutgoing.callId == call.callHeaders["call-id"]?.getOrNull(0)) {
+            if (pendingOutgoing != null && pendingOutgoing.callId == call.callIdOrNull()) {
                 Rlog.w(TAG, "Local hangup before outgoing INVITE final answer; sending CANCEL callId=${pendingOutgoing.callId}")
                 sendCancelForPendingOutgoingInvite(pendingOutgoing, "local hangup before final INVITE answer")
                 currentCall = null
@@ -1993,17 +2000,17 @@ a=sendrecv
         if (!call.outgoing && incomingFinalResponseSent.get() && !callStarted.get()) {
             Rlog.w(TAG, "Local hangup before incoming ACK; deferring BYE until ACK and keeping 200 OK retransmission active")
             incomingHangupAfterAck.set(true)
-            rememberTerminatedIncomingCall(call.callHeaders["call-id"]?.getOrNull(0).orEmpty(), "local pre-ACK hangup")
+            rememberTerminatedIncomingCall(call.callIdOrEmpty(), "local pre-ACK hangup")
             onCancelledCall?.invoke(Object(), "", emptyMap())
             return
         }
 
         sendByeForCall(call)
-        if (!call.outgoing) rememberTerminatedIncomingCall(call.callHeaders["call-id"]?.getOrNull(0).orEmpty(), "local BYE")
+        if (!call.outgoing) rememberTerminatedIncomingCall(call.callIdOrEmpty(), "local BYE")
         currentCall = null
         incomingAcceptedAwaitingAck.set(false)
         incomingHangupAfterAck.set(false)
-        clearPendingOutgoingInvite(call.callHeaders["call-id"]?.getOrNull(0), closeRtpSocket = false, reason = "confirmed call terminated")
+        clearPendingOutgoingInvite(call.callIdOrNull(), closeRtpSocket = false, reason = "confirmed call terminated")
         onCancelledCall?.invoke(Object(), "", emptyMap())
     }
 
@@ -2218,7 +2225,7 @@ a=sendrecv
                 if (cseq.contains("ACK")) return@setResponseCallback  false
 
                 if (cseq.contains("INVITE") && (resp.statusCode == 200 || resp.statusCode == 202)) {
-                    val finalInviteCallId = resp.headers["call-id"]?.getOrNull(0).orEmpty()
+                    val finalInviteCallId = resp.callIdOrEmpty()
                     val finalInviteAfterLocalCancel = pendingOutgoingInvite?.callId == finalInviteCallId &&
                         pendingOutgoingInvite?.cancelSent?.get() == true
                     if (finalInviteAfterLocalCancel) {
@@ -2293,7 +2300,7 @@ a=sendrecv
                 } else {
                     Rlog.d(TAG, "Invite got status ${resp.statusCode} = ${resp.statusString}")
                     if(resp.statusCode >= 400) {
-                        val failedCallId = resp.headers["call-id"]?.getOrNull(0).orEmpty()
+                        val failedCallId = resp.callIdOrEmpty()
                         val failedCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
                         val activeCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0)
                         val pendingCallId = pendingOutgoingInvite?.callId
@@ -2395,7 +2402,7 @@ a=sendrecv
                 Rlog.d(TAG, "Outgoing $outgoingDialogPhase dialog SDP: status=${resp.statusCode} cseq=$responseCseq remoteTarget=${currentCall?.remoteContact} nextLocalCseq=${currentCall?.localCseq?.get()} route=${currentCall?.callHeaders?.get("route")}")
 
                 if (responseCseq.contains("INVITE") && (resp.statusCode == 200 || resp.statusCode == 202)) {
-                    val finalInviteCallId = resp.headers["call-id"]?.getOrNull(0).orEmpty()
+                    val finalInviteCallId = resp.callIdOrEmpty()
                     val finalInviteAfterLocalCancel = pendingOutgoingInvite?.callId == finalInviteCallId &&
                         pendingOutgoingInvite?.cancelSent?.get() == true
                     if (finalInviteAfterLocalCancel) {
@@ -2681,7 +2688,7 @@ a=sendrecv
     var prAckWait = mutableSetOf<Int>()
 
     private fun handleInDialogInvite(request: SipRequest, call: Call, responseWriter: OutputStream): Int {
-        val callId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        val callId = request.callIdOrEmpty()
         val cseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
         val sdp = request.body.toString(Charsets.UTF_8).split("[\r\n]+".toRegex()).toList()
         Rlog.d(TAG, "Handling in-dialog INVITE: callId=$callId cseq=$cseq sdp=$sdp")
