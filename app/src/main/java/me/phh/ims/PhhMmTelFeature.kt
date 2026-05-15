@@ -1,4 +1,6 @@
 //SPDX-License-Identifier: GPL-2.0
+@file:Suppress("DEPRECATION")
+
 package me.phh.ims
 
 import android.content.Context
