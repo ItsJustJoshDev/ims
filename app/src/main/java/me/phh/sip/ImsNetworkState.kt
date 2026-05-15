@@ -12,6 +12,16 @@ import android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_LTE
 import java.net.Inet6Address
 import java.net.InetAddress
 
+internal sealed class ImsNetworkEndpointResolution {
+    data class Success(
+        val pcscfAddr: InetAddress,
+        val localAddr: InetAddress,
+    ) : ImsNetworkEndpointResolution()
+
+    object WaitingForPcscf : ImsNetworkEndpointResolution()
+    object NoLocalAddress : ImsNetworkEndpointResolution()
+}
+
 internal object ImsNetworkState {
     fun registrationTechName(tech: Int): String =
         when (tech) {
@@ -59,6 +69,56 @@ internal object ImsNetworkState {
             .filter { !it.isAnyLocalAddress && !it.isLoopbackAddress }
             .sortedBy { if (it is Inet6Address) 0 else 1 }
             .firstOrNull()
+    }
+
+    fun resolveEndpoint(
+        tag: String,
+        lp: LinkProperties,
+        mnc: String,
+        mcc: String,
+    ): ImsNetworkEndpointResolution {
+        val pcscfs = getPcscfServers(lp)
+        val pcscf = if (pcscfs.isNotEmpty()) {
+            pcscfs[0]
+        } else {
+            // RIL did not provide P-CSCF via LinkProperties. Try standard
+            // 3GPP DNS discovery (TS 23.003 §13.2): resolve the well-known
+            // IMS domain for this PLMN.
+            val dnsFallback = try {
+                InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org")
+            } catch (t: Throwable) {
+                null
+            } ?: try {
+                InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.3gppnetwork.org")
+            } catch (t: Throwable) {
+                null
+            } ?: android.os.SystemProperties
+                .get("persist.ims.pcscf_fallback", "")
+                .takeIf { it.isNotEmpty() }
+                ?.let {
+                    try {
+                        InetAddress.getByName(it)
+                    } catch (t: Throwable) {
+                        null
+                    }
+                }
+
+            if (dnsFallback != null) {
+                Rlog.w(tag, "No P-CSCF from RIL, using fallback: $dnsFallback")
+                dnsFallback
+            } else {
+                Rlog.w(tag, "No P-CSCF and all fallbacks failed, waiting for onLinkPropertiesChanged")
+                return ImsNetworkEndpointResolution.WaitingForPcscf
+            }
+        }
+
+        val localAddr = getImsLocalAddress(lp)
+        if (localAddr == null) {
+            Rlog.w(tag, "No usable local address on IMS link properties")
+            return ImsNetworkEndpointResolution.NoLocalAddress
+        }
+
+        return ImsNetworkEndpointResolution.Success(pcscf, localAddr)
     }
 
     fun ratName(rat: Int): String =

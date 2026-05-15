@@ -508,38 +508,22 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         imsRegistrationTech = detectRegistrationTech(lp)
         Rlog.d(TAG, "IMS registration tech ${registrationTechName(imsRegistrationTech)} interface=${lp.interfaceName} caps=${connectivityManager.getNetworkCapabilities(network)}")
         imsRegisteringCallback?.invoke(imsRegistrationTech)
-        val pcscfs = getPcscfServers(lp)
-        val pcscf = if (pcscfs.isNotEmpty()) {
-            pcscfs[0]
-        } else {
-            // RIL didn't provide P-CSCF via LinkProperties. Try standard 3GPP DNS discovery
-            // (TS 23.003 §13.2): resolve the well-known IMS domain for this PLMN.
-            // These are public DNS records so InetAddress.getByName() over any network works.
-            // NOTE: future e164.arpa (ENUM) lookups must use network.getAllByName() instead,
-            // as those records are only served by the carrier's IMS PDN DNS servers.
-            val dnsFallback =
-                try { InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org") } catch(t: Throwable) { null }
-                ?: try { InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.3gppnetwork.org") } catch(t: Throwable) { null }
-                ?: android.os.SystemProperties.get("persist.ims.pcscf_fallback", "").takeIf { it.isNotEmpty() }
-                    ?.let { try { InetAddress.getByName(it) } catch(t: Throwable) { null } }
-            if (dnsFallback != null) {
-                Rlog.w(TAG, "No P-CSCF from RIL, using fallback: $dnsFallback")
-                dnsFallback
-            } else {
-                Rlog.w(TAG, "No P-CSCF and all fallbacks failed, waiting for onLinkPropertiesChanged")
+        when (val endpoint = ImsNetworkState.resolveEndpoint(TAG, lp, mnc, mcc)) {
+            is ImsNetworkEndpointResolution.Success -> {
+                localAddr = endpoint.localAddr
+                pcscfAddr = endpoint.pcscfAddr
+            }
+
+            ImsNetworkEndpointResolution.WaitingForPcscf -> {
                 abandonnedBecauseOfNoPcscf = true
                 return
             }
-        }
 
-        val newLocalAddr = getImsLocalAddress(lp)
-        if (newLocalAddr == null) {
-            Rlog.w(TAG, "No usable local address on IMS link properties")
-            failConnectAndRetry("No usable local address on IMS link properties")
-            return
+            ImsNetworkEndpointResolution.NoLocalAddress -> {
+                failConnectAndRetry("No usable local address on IMS link properties")
+                return
+            }
         }
-        localAddr = newLocalAddr
-        pcscfAddr = pcscf
 
         Rlog.w(TAG, "Connecting with address $localAddr to $pcscfAddr")
 
