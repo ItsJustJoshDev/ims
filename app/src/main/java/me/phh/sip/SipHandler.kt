@@ -81,10 +81,9 @@ class SipHandler(val ctxt: Context) {
     private var akaDigest =
         """Digest username="$user",realm="$realm",nonce="",uri="sip:$realm",response="",algorithm=AKAv1-MD5"""
 
-    fun generateCallId(): SipHeadersMap {
-        val callId = randomBytes(12).toHex()
-        return mapOf("call-id" to listOf(callId))
-    } private var registerCounter = 1
+    fun generateCallId(): SipHeadersMap = SipCallIdGenerator.generate()
+
+    private var registerCounter = 1
     private var registerHeaders =
         """
         From: <sip:$user>
