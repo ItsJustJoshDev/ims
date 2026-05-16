@@ -88,27 +88,14 @@ class SipHandler(
         subId = subId,
         onWfcDisabled = { reason -> onWfcDisabled(reason) },
     ).also { it.start() }
-    private val mcc = subTelephonyManager.simOperator.substring(0 until 3)
-    private var mnc =
-        subTelephonyManager.simOperator.substring(3).let { if (it.length == 2) "0$it" else it }
+    private val carrierSettings = SipCarrierSettings.fromSimOperator(subTelephonyManager.simOperator)
+    private val mcc = carrierSettings.mcc
+    private val mnc = carrierSettings.mnc
     private val imsi = subTelephonyManager.subscriberId
 
-    /* Carrier specific settings
-     */
-    val isControlSocketUdp = when(mcc + mnc) {
-        "450006" -> true // LG U+ can only do UDP
-        "208010" -> true // 20810 can do TCP and UDP. use this for testing
-        else -> false
-    }
-    val forceSmsc = when(mcc + mnc) {
-        "450006" -> "821080010585" // LG U+
-        else -> null
-    }
-    // Sess is more secure so default to it
-    val requireNonsessAka = when(mcc + mnc) {
-        "450006" -> true
-        else -> false
-    }
+    val isControlSocketUdp = carrierSettings.isControlSocketUdp
+    val forceSmsc = carrierSettings.forceSmsc
+    val requireNonsessAka = carrierSettings.requireNonsessAka
 
     //private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
