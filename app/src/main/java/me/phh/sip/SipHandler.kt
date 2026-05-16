@@ -7,10 +7,6 @@ import android.media.*
 import android.net.*
 import android.os.Handler
 import android.os.HandlerThread
-import android.telephony.CellInfoGsm
-import android.telephony.CellInfoLte
-import android.telephony.CellInfoNr
-import android.telephony.CellInfoWcdma
 import android.telephony.Rlog
 import android.telephony.SmsManager
 import android.net.TelephonyNetworkSpecifier
@@ -49,9 +45,6 @@ class SipHandler(
         connectivityManager = ctxt.getSystemService(ConnectivityManager::class.java)
         ipSecManager = ctxt.getSystemService(IpSecManager::class.java)
     }
-
-    private fun getAllCellInfoForRegistrationLog() =
-        subTelephonyManager.getAllCellInfo()
 
     private fun createVoiceCommunicationAudioRecord(bufferSize: Int): AudioRecord =
         AudioRecord(
@@ -901,26 +894,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         commonHeaders += newHeaders
     }
     fun register(_writer: OutputStream? = null) {
-        val cellInfoList = getAllCellInfoForRegistrationLog()
-        for(cell in cellInfoList) {
-            if(cell is CellInfoLte) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "LTE cell: ${cellIdentity.ci}, ${cellIdentity.pci}, ${cellIdentity.tac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
-            } else if(cell is CellInfoNr) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "NR cell: ${cellIdentity.operatorAlphaLong}, ${cellIdentity.operatorAlphaShort}, ${cellIdentity}")
-            } else if(cell is CellInfoWcdma) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "WCDMA cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
-            } else if(cell is CellInfoGsm) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "GSM cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
-            }
-        }
+        RegistrationCellInfoLogger.log(TAG, subTelephonyManager)
 
         // XXX samsung rom apparently regenerates local SPIC/SPIS every register,
         // this doesn't affect current connections but possibly affects new incoming
