@@ -998,30 +998,14 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
     }
 
     fun subscribe() {
-        val contactTel = SipContactHeaders.mmtelContact(
-            userPart = myTel,
-            localEndpoint = SipContactHeaders.localEndpoint(socket, serverSocket.localPort),
-            transport = SipContactHeaders.transport(socket),
-            sipInstance = SipContactHeaders.sipInstanceFromImei(imei),
+        val msg = SipRegEventSubscribeBuilder.build(
+            mySip = mySip,
+            myTel = myTel,
+            commonHeaders = commonHeaders,
+            socket = socket,
+            serverPort = serverSocket.localPort,
+            imei = imei,
         )
-        val msg =
-            SipRequest(
-                SipMethod.SUBSCRIBE,
-                "$mySip",
-                commonHeaders +
-                    """
-                    Contact: $contactTel
-                    P-Preferred-Identity: <$mySip>
-                    Event: reg
-                    Expires: 600000
-                    Supported: sec-agree
-                    Require: sec-agree
-                    Proxy-Require: sec-agree
-                    Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, INFO, MESSAGE, PRACK, OPTIONS
-                    Accept: application/reginfo+xml
-                    P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=20810b8c49752501
-                    """.toSipHeadersMap()
-            )
         setResponseCallback(msg.headers["call-id"]!![0], ::subscribeCallback)
         Rlog.d(TAG, "Sending $msg")
         synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
