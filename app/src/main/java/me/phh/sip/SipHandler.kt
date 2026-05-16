@@ -3,7 +3,6 @@ package me.phh.sip
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.database.ContentObserver
 import android.media.*
 import android.net.*
 import android.os.Handler
@@ -88,7 +87,6 @@ class SipHandler(
     private val subTelephonyManager = telephonyManager.createForSubscriptionId(subId)
     private val imei = getDeviceIdForSlot(activeSubscription.simSlotIndex)
 
-    private val simInfoUri = Uri.parse("content://telephony/siminfo")
     private fun normalizeOutgoingDialTargetForTelUri(rawPhoneNumber: String): String =
         OutgoingDialTargetNormalizer.normalize(
             rawPhoneNumber = rawPhoneNumber,
@@ -97,20 +95,13 @@ class SipHandler(
             logTag = TAG,
         )
 
-    @Volatile private var observedWfcEnabled: Boolean? = null
-private val wfcSubscriptionObserver = object : ContentObserver(myHandler) {
-        override fun onChange(selfChange: Boolean) {
-            handleWfcSubscriptionSettingChanged("siminfo observer")
-        }
-
-        override fun onChange(selfChange: Boolean, uri: Uri?) {
-            handleWfcSubscriptionSettingChanged("siminfo observer uri=$uri")
-        }
-    }
-
-    init {
-        registerWfcSubscriptionObserver()
-    }
+    private val wfcSubscriptionSettingMonitor = WfcSubscriptionSettingMonitor(
+        tag = TAG,
+        ctxt = ctxt,
+        handler = myHandler,
+        subId = subId,
+        onWfcDisabled = { reason -> onWfcDisabled(reason) },
+    ).also { it.start() }
     private val mcc = subTelephonyManager.simOperator.substring(0 until 3)
     private var mnc =
         subTelephonyManager.simOperator.substring(3).let { if (it.length == 2) "0$it" else it }
@@ -531,57 +522,6 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         imsNetworkRequestRestarter.schedule(reason, initialDelayMs)
     }
 
-
-    private fun readWfcEnabledSubscriptionProperty(): Boolean? {
-        return try {
-            ctxt.contentResolver.query(
-                simInfoUri,
-                arrayOf("_id", "wfc_ims_enabled"),
-                null,
-                null,
-                null,
-            )?.use { cursor ->
-                val idColumn = cursor.getColumnIndex("_id")
-                val wfcColumn = cursor.getColumnIndex("wfc_ims_enabled")
-                if (idColumn < 0 || wfcColumn < 0) {
-                    Rlog.w(TAG, "siminfo is missing WFC columns id=$idColumn wfc=$wfcColumn")
-                    return null
-                }
-                while (cursor.moveToNext()) {
-                    if (cursor.getInt(idColumn) == subId) {
-                        return cursor.getInt(wfcColumn) == 1
-                    }
-                }
-                Rlog.w(TAG, "No siminfo row found for subId=$subId while checking WFC")
-                null
-            }
-        } catch (t: Throwable) {
-            Rlog.d(TAG, "Reading WFC subscription property failed", t)
-            null
-        }
-    }
-
-    private fun registerWfcSubscriptionObserver() {
-        observedWfcEnabled = readWfcEnabledSubscriptionProperty()
-        Rlog.d(TAG, "Initial WFC subscription setting enabled=$observedWfcEnabled")
-        try {
-            ctxt.contentResolver.registerContentObserver(simInfoUri, true, wfcSubscriptionObserver)
-            Rlog.d(TAG, "Registered WFC subscription setting observer")
-        } catch (t: Throwable) {
-            Rlog.d(TAG, "Registering WFC subscription setting observer failed", t)
-        }
-    }
-
-    private fun handleWfcSubscriptionSettingChanged(reason: String) {
-        val enabled = readWfcEnabledSubscriptionProperty() ?: return
-        val old = observedWfcEnabled
-        observedWfcEnabled = enabled
-        if (old == enabled) return
-        Rlog.d(TAG, "WFC subscription setting changed old=$old enabled=$enabled reason=$reason")
-        if (old == true && !enabled) {
-            onWfcDisabled(reason)
-        }
-    }
 
     private fun shouldReconnectAfterSipTransportLoss(reason: String): Boolean {
         if (pendingCellularReconnectAfterWfcDisable) {
