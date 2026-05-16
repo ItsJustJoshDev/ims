@@ -554,28 +554,15 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         Rlog.d(TAG, "Requesting AKA challenge")
         val akaResult = sipAkaChallenge(subTelephonyManager, nonceB64)
-        // Use non-sess digest when server doesn't offer qop (no cnonce/nc in response).
-        akaDigest =
-            if(requireNonsessAka || wwwAuthenticateParams["qop"] == null)
-                SipAkaDigest(
-                    user = user,
-                    realm = challengeRealm,
-                    uri = "sip:$realm",
-                    nonceB64 = nonceB64,
-                    opaque = wwwAuthenticateParams["opaque"],
-                    akaResult = akaResult
-                )
-                .toString()
-            else
-            SipAkaDigestSess(
-                    user = user,
-                    realm = challengeRealm,
-                    uri = "sip:$realm",
-                    nonceB64 = nonceB64,
-                    opaque = wwwAuthenticateParams["opaque"],
-                    akaResult = akaResult
-                )
-                .toString()
+        akaDigest = SipRegistrationDigestFactory.create(
+            user = user,
+            realm = challengeRealm,
+            uri = "sip:$realm",
+            nonceB64 = nonceB64,
+            opaque = wwwAuthenticateParams["opaque"],
+            akaResult = akaResult,
+            useNonsessAka = requireNonsessAka || wwwAuthenticateParams["qop"] == null,
+        )
 
         var portS = 5060
         // Check if there is a security-server header in the reply
