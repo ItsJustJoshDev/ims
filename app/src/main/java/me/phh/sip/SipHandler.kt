@@ -579,24 +579,21 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             return
         }
 
-        val (wwwAuthenticateType, wwwAuthenticateParams) =
-            plainRegReply.headers["www-authenticate"]!![0].getAuthValues()
-        require(wwwAuthenticateType == "Digest")
-        val nonceB64 = wwwAuthenticateParams["nonce"]!!
-        // Use the realm from the 401 challenge for H1 and the Authorization realm= field,
-        // as required by RFC 2617. Carriers often differ from the subscriber's own realm.
-        val challengeRealm = wwwAuthenticateParams["realm"] ?: realm
+        val registerChallenge = SipRegisterChallengeParser.parse(
+            response = plainRegReply,
+            fallbackRealm = realm,
+        )
 
         Rlog.d(TAG, "Requesting AKA challenge")
-        val akaResult = sipAkaChallenge(subTelephonyManager, nonceB64)
+        val akaResult = sipAkaChallenge(subTelephonyManager, registerChallenge.nonceB64)
         akaDigest = SipRegistrationDigestFactory.create(
             user = user,
-            realm = challengeRealm,
+            realm = registerChallenge.realm,
             uri = "sip:$realm",
-            nonceB64 = nonceB64,
-            opaque = wwwAuthenticateParams["opaque"],
+            nonceB64 = registerChallenge.nonceB64,
+            opaque = registerChallenge.opaque,
             akaResult = akaResult,
-            useNonsessAka = requireNonsessAka || wwwAuthenticateParams["qop"] == null,
+            useNonsessAka = requireNonsessAka || registerChallenge.qop == null,
         )
 
         var portS = 5060
