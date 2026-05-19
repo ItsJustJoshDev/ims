@@ -89,6 +89,97 @@ internal object SipAmrRtpPayload {
         return 1 + ((speechBits + 7) / 8)
     }
 
+    private fun buildRtpHeader(
+        payloadType: Int,
+        sequenceNumber: Int,
+        timestamp: Int,
+        marker: Boolean = false,
+    ): ByteArray =
+        byteArrayOf(
+            0x80.toByte(),
+            ((if (marker) 0x80 else 0) or (payloadType and 0x7f)).toByte(),
+            (sequenceNumber shr 8).toByte(),
+            (sequenceNumber and 0xff).toByte(),
+            (timestamp shr 24).toByte(),
+            ((timestamp shr 16) and 0xff).toByte(),
+            ((timestamp shr 8) and 0xff).toByte(),
+            (timestamp and 0xff).toByte(),
+            0x03,
+            0x00,
+            0xd2.toByte(),
+            0x00,
+        )
+
+    fun buildNoDataRtpPacket(
+        audioCodec: NegotiatedAudioCodec,
+        payloadType: Int,
+        sequenceNumber: Int,
+        timestamp: Int,
+        marker: Boolean = false,
+    ): ByteArray {
+        // Preserve the current AMR-NB behavior exactly:
+        //   CMR=7 (12.2 kbps), F=0, FT=15 (No Data), Q=1.
+        //
+        // AMR-WB is not selected yet. When it is enabled, this helper is the
+        // single place to adjust codec-mode request/no-data framing if needed.
+        val noDataPayload = when (audioCodec.sdpCodecName) {
+            "AMR", "AMR-WB" -> byteArrayOf(0x77.toByte(), 0xc0.toByte())
+            else -> byteArrayOf(0x77.toByte(), 0xc0.toByte())
+        }
+
+        return buildRtpHeader(
+            payloadType = payloadType,
+            sequenceNumber = sequenceNumber,
+            timestamp = timestamp,
+            marker = marker,
+        ) + noDataPayload
+    }
+
+    fun buildBandwidthEfficientRtpPacketFromStorageFrame(
+        audioCodec: NegotiatedAudioCodec,
+        payloadType: Int,
+        sequenceNumber: Int,
+        timestamp: Int,
+        storageFrame: ByteArray,
+        marker: Boolean = false,
+    ): ByteArray? {
+        if (storageFrame.isEmpty()) return null
+
+        // Android MediaCodec emits AMR storage-format frames:
+        //   byte 0 = frame header: [0][FT(4)][Q][P][P]
+        //   bytes 1..N = speech bits, MSB-first, octet padded.
+        //
+        // Build RFC 4867 bandwidth-efficient single-frame payload:
+        //   CMR(4), F(1), FT(4), Q(1), speech bits...
+        val ft = (storageFrame[0].toUByte().toInt() shr 3) and 0x0f
+        val q = (storageFrame[0].toUByte().toInt() shr 2) and 0x01
+        val frameSize = storageFrameSizeBytes(audioCodec, ft) ?: return null
+        if (storageFrame.size < frameSize) return null
+
+        val cmr = 0x0f // no codec-mode request
+        val f = 0      // one frame only
+
+        val payloadByte0 = (cmr shl 4) or (f shl 3) or (ft shr 1)
+        val payloadByte1 = ((ft and 1) shl 7) or
+            (q shl 6) or
+            (storageFrame[1].toUByte().toInt() shr 2)
+
+        val payloadRest = (1 until frameSize - 1).map { i ->
+            val lo = (storageFrame[i].toUByte().toInt() and 0x03) shl 6
+            val hi = (storageFrame[i + 1].toUByte().toInt() shr 2) and 0x3f
+            lo or hi
+        }.map { it.toByte() }.toByteArray()
+
+        val payload = byteArrayOf(payloadByte0.toByte(), payloadByte1.toByte()) + payloadRest
+
+        return buildRtpHeader(
+            payloadType = payloadType,
+            sequenceNumber = sequenceNumber,
+            timestamp = timestamp,
+            marker = marker,
+        ) + payload
+    }
+
     fun storageFrameFromBandwidthEfficientRtp(
         audioCodec: NegotiatedAudioCodec,
         packet: ByteArray,
