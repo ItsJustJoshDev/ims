@@ -41,32 +41,45 @@ jobs:
           java-version: '17'
           cache: gradle
 
-# ------------------------------------------------------------
-# Android SDK
-# ------------------------------------------------------------
-- name: Setup Android SDK
-  run: |
-    export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
-    export ANDROID_HOME=$ANDROID_SDK_ROOT
+      # ------------------------------------------------------------
+      # Android SDK
+      # ------------------------------------------------------------
+      - name: Setup Android SDK
+        shell: bash
+        run: |
+          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          export ANDROID_HOME=$ANDROID_SDK_ROOT
 
-    echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-    echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
-    echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
-    echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          # Find sdkmanager dynamically
+          SDKMANAGER=$(find $ANDROID_SDK_ROOT -name sdkmanager | head -n 1)
 
-    export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin
-    export PATH=$PATH:$ANDROID_SDK_ROOT/platform-tools
+          echo "sdkmanager path: $SDKMANAGER"
 
-    which sdkmanager || true
-    sdkmanager --version
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found"
+            exit 1
+          fi
 
-    yes | sdkmanager --licenses > /dev/null
+          SDKMANAGER_DIR=$(dirname "$SDKMANAGER")
 
-    sdkmanager \
-      "platform-tools" \
-      "platforms;android-35" \
-      "build-tools;35.0.0"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          echo "$SDKMANAGER_DIR" >> $GITHUB_PATH
+
+          export PATH=$PATH:$SDKMANAGER_DIR
+          export PATH=$PATH:$ANDROID_SDK_ROOT/platform-tools
+
+          which sdkmanager
+          sdkmanager --version
+
+          yes | sdkmanager --licenses > /dev/null
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       # ------------------------------------------------------------
       # Hidden API android.jar
