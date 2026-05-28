@@ -2,130 +2,206 @@ name: Build PhhIms Magisk Module
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build APK + Magisk Module
+    runs-on: ubuntu-24.04
+
+    env:
+      GRADLE_OPTS: >-
+        -Dorg.gradle.daemon=false
+        -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseParallelGC"
+        -Dkotlin.incremental=false
 
     steps:
-      - name: Checkout repo
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 1
 
-      - name: Set up JDK 17
+      # ------------------------------------------------------------
+      # Java
+      # ------------------------------------------------------------
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '17'
-          distribution: 'temurin'
+          cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK platform API 35
+      # ------------------------------------------------------------
+      # Android SDK
+      # Avoid android-actions/setup-android because it triggers
+      # interactive license installs on modern runners.
+      # ------------------------------------------------------------
+      - name: Setup Android SDK
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
-          sdkmanager "platforms;android-35"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
 
-      # ---------------------------------------------------------------
-      # android.jar with internal APIs
-      # The standard SDK android.jar doesn't expose com.android.internal
-      # and hidden telephony/IMS classes. We download a pre-merged jar
-      # from the android-jar-with-hidden-api project (API 35 compatible).
-      # ---------------------------------------------------------------
-      - name: Fetch android.jar with hidden APIs
+          sdkmanager --version
+
+          yes | sdkmanager --licenses > /dev/null
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      # ------------------------------------------------------------
+      # Hidden API android.jar
+      # ------------------------------------------------------------
+      - name: Download hidden API android.jar
         run: |
           mkdir -p app/libs
-          curl -L \
+
+          curl -L --fail --retry 5 --retry-delay 5 \
             "https://github.com/Reginer/aosp-android-jar/releases/download/android-35/android.jar" \
             -o app/libs/android.jar
-          echo "android.jar size: $(wc -c < app/libs/android.jar) bytes"
 
+          echo "Downloaded hidden API android.jar"
+          ls -lh app/libs/android.jar
+
+      # ------------------------------------------------------------
+      # Gradle permissions
+      # ------------------------------------------------------------
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Build release APK
-        run: ./gradlew assembleRelease
+      # ------------------------------------------------------------
+      # Validate Gradle wrapper
+      # ------------------------------------------------------------
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v3
 
+      # ------------------------------------------------------------
+      # Build APK
+      # ------------------------------------------------------------
+      - name: Build release APK
+        run: |
+          ./gradlew \
+            assembleRelease \
+            --stacktrace \
+            --no-daemon
+
+      # ------------------------------------------------------------
+      # Verify unsigned APK exists
+      # ------------------------------------------------------------
+      - name: Verify build outputs
+        run: |
+          ls -R app/build/outputs || true
+
+          test -f app/build/outputs/apk/release/app-release-unsigned.apk
+
+      # ------------------------------------------------------------
+      # Sign APK
+      # ------------------------------------------------------------
       - name: Sign APK with bundled platform keys
         run: |
-          # Use the keys/ directory that ships with krazey/ims
-          LD_LIBRARY_PATH=./signapk/ java -jar signapk/signapk.jar \
-            keys/platform.x509.pem keys/platform.pk8 \
-            ./app/build/outputs/apk/release/app-release-unsigned.apk \
+          LD_LIBRARY_PATH=./signapk/ \
+          java -jar signapk/signapk.jar \
+            keys/platform.x509.pem \
+            keys/platform.pk8 \
+            app/build/outputs/apk/release/app-release-unsigned.apk \
             PhhIms.apk
-          echo "APK signed successfully"
+
+          echo "Signed APK created"
           ls -lh PhhIms.apk
 
-      # ---------------------------------------------------------------
-      # Build the Magisk module zip
-      # ---------------------------------------------------------------
+      # ------------------------------------------------------------
+      # Assemble Magisk module
+      # ------------------------------------------------------------
       - name: Assemble Magisk module
         run: |
+          set -e
+
           MODULE_DIR=magisk_module
-          mkdir -p $MODULE_DIR/system/priv-app/PhhIms
-          mkdir -p $MODULE_DIR/system/etc/permissions
-          mkdir -p $MODULE_DIR/system/product/overlay
-          mkdir -p $MODULE_DIR/META-INF/com/google/android
+
+          mkdir -p "$MODULE_DIR/system/priv-app/PhhIms"
+          mkdir -p "$MODULE_DIR/system/etc/permissions"
+          mkdir -p "$MODULE_DIR/system/product/overlay"
+          mkdir -p "$MODULE_DIR/META-INF/com/google/android"
 
           # APK
-          cp PhhIms.apk $MODULE_DIR/system/priv-app/PhhIms/PhhIms.apk
+          cp PhhIms.apk \
+            "$MODULE_DIR/system/priv-app/PhhIms/PhhIms.apk"
 
-          # privapp-permissions whitelist
-          cat > $MODULE_DIR/system/etc/permissions/privapp-permissions-me.phh.ims.xml << 'PERMISSIONS'
+          # Privapp permissions
+          cat > "$MODULE_DIR/system/etc/permissions/privapp-permissions-me.phh.ims.xml" << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <permissions>
               <privapp-permissions package="me.phh.ims">
                   <permission name="android.permission.READ_PRIVILEGED_PHONE_STATE"/>
                   <permission name="android.permission.MODIFY_PHONE_STATE"/>
+                  <permission name="android.permission.READ_PRECISE_PHONE_STATE"/>
               </privapp-permissions>
           </permissions>
-          PERMISSIONS
+          EOF
 
-          # IMS MmTel binding overlay
-          cp module/system/product/overlay/PhhImsOverlay.apk \
-             $MODULE_DIR/system/product/overlay/PhhImsOverlay.apk 2>/dev/null || true
+          # Optional overlay
+          if [ -f module/system/product/overlay/PhhImsOverlay.apk ]; then
+            cp module/system/product/overlay/PhhImsOverlay.apk \
+              "$MODULE_DIR/system/product/overlay/PhhImsOverlay.apk"
+          fi
 
           # module.prop
-          cat > $MODULE_DIR/module.prop << 'PROP'
+          cat > "$MODULE_DIR/module.prop" << 'EOF'
           id=phhims_d2s
-          name=PhhIms VoLTE for d2s (EvoX)
+          name=PhhIms VoLTE for d2s
           version=v1
           versionCode=1
-          author=krazey/phhusson, adapted for d2s 310/240
-          description=VoLTE/VoWiFi IMS stack for Note 10+ d2s on Evolution X. Requires Magisk root.
-          PROP
+          author=krazey/phhusson adapted by Josh
+          description=VoLTE/VoWiFi IMS stack for Samsung Galaxy Note10+ d2s custom ROMs
+          EOF
 
-          # Magisk update binary (required boilerplate)
-          cat > $MODULE_DIR/META-INF/com/google/android/update-binary << 'BINARY'
+          # update-binary
+          cat > "$MODULE_DIR/META-INF/com/google/android/update-binary" << 'EOF'
           #!/sbin/sh
           SKIPUNZIP=1
           unzip -o "$ZIPFILE" 'system/*' -d "$MODPATH"
           unzip -o "$ZIPFILE" 'module.prop' -d "$MODPATH"
           set_perm_recursive "$MODPATH/system/priv-app" root root 0755 0644
           set_perm "$MODPATH/system/priv-app/PhhIms/PhhIms.apk" root root 0644
-          BINARY
+          EOF
 
-          echo "#MAGISK" > $MODULE_DIR/META-INF/com/google/android/updater-script
+          chmod +x "$MODULE_DIR/META-INF/com/google/android/update-binary"
 
-          # Package it
-          cd $MODULE_DIR
+          # updater-script
+          cat > "$MODULE_DIR/META-INF/com/google/android/updater-script" << 'EOF'
+          #MAGISK
+          EOF
+
+          cd "$MODULE_DIR"
           zip -r ../PhhIms-d2s-magisk.zip .
-          cd ..
-          echo "Module zip size: $(wc -c < PhhIms-d2s-magisk.zip) bytes"
 
-      - name: Upload APK artifact
+      # ------------------------------------------------------------
+      # Upload artifacts
+      # ------------------------------------------------------------
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: PhhIms-APK
           path: PhhIms.apk
-          retention-days: 30
+          retention-days: 14
 
-      - name: Upload Magisk module artifact
+      - name: Upload Magisk Module
         uses: actions/upload-artifact@v4
         with:
-          name: PhhIms-d2s-Magisk-Module
+          name: PhhIms-d2s-Magisk
           path: PhhIms-d2s-magisk.zip
-          retention-days: 30
-          
+          retention-days: 14
