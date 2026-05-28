@@ -53,7 +53,7 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
-          # Find sdkmanager dynamically
+          # Locate sdkmanager dynamically
           SDKMANAGER=$(find $ANDROID_SDK_ROOT -name sdkmanager | head -n 1)
 
           echo "sdkmanager path: $SDKMANAGER"
@@ -74,8 +74,20 @@ jobs:
           which sdkmanager
           sdkmanager --version
 
-          yes | sdkmanager --licenses > /dev/null
+      # ------------------------------------------------------------
+      # Accept SDK licenses
+      # ------------------------------------------------------------
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
 
+      # ------------------------------------------------------------
+      # Install SDK packages
+      # ------------------------------------------------------------
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
@@ -118,9 +130,9 @@ jobs:
             --no-daemon
 
       # ------------------------------------------------------------
-      # Verify unsigned APK exists
+      # Verify APK exists
       # ------------------------------------------------------------
-      - name: Verify build outputs
+      - name: Verify APK output
         run: |
           ls -R app/build/outputs || true
 
@@ -129,7 +141,7 @@ jobs:
       # ------------------------------------------------------------
       # Sign APK
       # ------------------------------------------------------------
-      - name: Sign APK with bundled platform keys
+      - name: Sign APK
         run: |
           LD_LIBRARY_PATH=./signapk/ \
           java -jar signapk/signapk.jar \
@@ -138,7 +150,7 @@ jobs:
             app/build/outputs/apk/release/app-release-unsigned.apk \
             PhhIms.apk
 
-          echo "Signed APK created"
+          echo "Signed APK:"
           ls -lh PhhIms.apk
 
       # ------------------------------------------------------------
@@ -152,7 +164,6 @@ jobs:
 
           mkdir -p "$MODULE_DIR/system/priv-app/PhhIms"
           mkdir -p "$MODULE_DIR/system/etc/permissions"
-          mkdir -p "$MODULE_DIR/system/product/overlay"
           mkdir -p "$MODULE_DIR/META-INF/com/google/android"
 
           # APK
@@ -170,12 +181,6 @@ jobs:
               </privapp-permissions>
           </permissions>
           EOF
-
-          # Optional overlay
-          if [ -f module/system/product/overlay/PhhImsOverlay.apk ]; then
-            cp module/system/product/overlay/PhhImsOverlay.apk \
-              "$MODULE_DIR/system/product/overlay/PhhImsOverlay.apk"
-          fi
 
           # module.prop
           cat > "$MODULE_DIR/module.prop" << 'EOF'
@@ -208,7 +213,7 @@ jobs:
           zip -r ../PhhIms-d2s-magisk.zip .
 
       # ------------------------------------------------------------
-      # Upload artifacts
+      # Upload APK
       # ------------------------------------------------------------
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -217,6 +222,9 @@ jobs:
           path: PhhIms.apk
           retention-days: 14
 
+      # ------------------------------------------------------------
+      # Upload Magisk module
+      # ------------------------------------------------------------
       - name: Upload Magisk Module
         uses: actions/upload-artifact@v4
         with:
