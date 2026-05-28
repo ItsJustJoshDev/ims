@@ -1,0 +1,131 @@
+name: Build PhhIms Magisk Module
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform API 35
+        run: |
+          sdkmanager "platforms;android-35"
+
+      # ---------------------------------------------------------------
+      # android.jar with internal APIs
+      # The standard SDK android.jar doesn't expose com.android.internal
+      # and hidden telephony/IMS classes. We download a pre-merged jar
+      # from the android-jar-with-hidden-api project (API 35 compatible).
+      # ---------------------------------------------------------------
+      - name: Fetch android.jar with hidden APIs
+        run: |
+          mkdir -p app/libs
+          curl -L \
+            "https://github.com/Reginer/aosp-android-jar/releases/download/android-35/android.jar" \
+            -o app/libs/android.jar
+          echo "android.jar size: $(wc -c < app/libs/android.jar) bytes"
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease
+
+      - name: Sign APK with bundled platform keys
+        run: |
+          # Use the keys/ directory that ships with krazey/ims
+          LD_LIBRARY_PATH=./signapk/ java -jar signapk/signapk.jar \
+            keys/platform.x509.pem keys/platform.pk8 \
+            ./app/build/outputs/apk/release/app-release-unsigned.apk \
+            PhhIms.apk
+          echo "APK signed successfully"
+          ls -lh PhhIms.apk
+
+      # ---------------------------------------------------------------
+      # Build the Magisk module zip
+      # ---------------------------------------------------------------
+      - name: Assemble Magisk module
+        run: |
+          MODULE_DIR=magisk_module
+          mkdir -p $MODULE_DIR/system/priv-app/PhhIms
+          mkdir -p $MODULE_DIR/system/etc/permissions
+          mkdir -p $MODULE_DIR/system/product/overlay
+          mkdir -p $MODULE_DIR/META-INF/com/google/android
+
+          # APK
+          cp PhhIms.apk $MODULE_DIR/system/priv-app/PhhIms/PhhIms.apk
+
+          # privapp-permissions whitelist
+          cat > $MODULE_DIR/system/etc/permissions/privapp-permissions-me.phh.ims.xml << 'PERMISSIONS'
+          <?xml version="1.0" encoding="utf-8"?>
+          <permissions>
+              <privapp-permissions package="me.phh.ims">
+                  <permission name="android.permission.READ_PRIVILEGED_PHONE_STATE"/>
+                  <permission name="android.permission.MODIFY_PHONE_STATE"/>
+              </privapp-permissions>
+          </permissions>
+          PERMISSIONS
+
+          # IMS MmTel binding overlay
+          cp module/system/product/overlay/PhhImsOverlay.apk \
+             $MODULE_DIR/system/product/overlay/PhhImsOverlay.apk 2>/dev/null || true
+
+          # module.prop
+          cat > $MODULE_DIR/module.prop << 'PROP'
+          id=phhims_d2s
+          name=PhhIms VoLTE for d2s (EvoX)
+          version=v1
+          versionCode=1
+          author=krazey/phhusson, adapted for d2s 310/240
+          description=VoLTE/VoWiFi IMS stack for Note 10+ d2s on Evolution X. Requires Magisk root.
+          PROP
+
+          # Magisk update binary (required boilerplate)
+          cat > $MODULE_DIR/META-INF/com/google/android/update-binary << 'BINARY'
+          #!/sbin/sh
+          SKIPUNZIP=1
+          unzip -o "$ZIPFILE" 'system/*' -d "$MODPATH"
+          unzip -o "$ZIPFILE" 'module.prop' -d "$MODPATH"
+          set_perm_recursive "$MODPATH/system/priv-app" root root 0755 0644
+          set_perm "$MODPATH/system/priv-app/PhhIms/PhhIms.apk" root root 0644
+          BINARY
+
+          echo "#MAGISK" > $MODULE_DIR/META-INF/com/google/android/updater-script
+
+          # Package it
+          cd $MODULE_DIR
+          zip -r ../PhhIms-d2s-magisk.zip .
+          cd ..
+          echo "Module zip size: $(wc -c < PhhIms-d2s-magisk.zip) bytes"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhhIms-APK
+          path: PhhIms.apk
+          retention-days: 30
+
+      - name: Upload Magisk module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhhIms-d2s-Magisk-Module
+          path: PhhIms-d2s-magisk.zip
+          retention-days: 30
+          
