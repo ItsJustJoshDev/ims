@@ -262,11 +262,12 @@ class SipHandler(
     //private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val user = "$imsi@$realm"
+    private var registerTargetRealm = realm
     private var akaDigest = ""
+    private var registerSecurityClientOverride: String? = null
+    private var selectedSecurityClientForPromotedRegister: String? = null
     private fun initialRegisterAuthorization(): String =
         """Digest username="$user",realm="$realm",nonce="",uri="sip:$realm",response="",algorithm=AKAv1-MD5"""
-
-
     fun generateCallId(): SipHeadersMap = SipCallIdGenerator.generate()
 
     private var registerCounter = 1
@@ -313,6 +314,8 @@ class SipHandler(
 
     private val dispatcher = SipDispatcher(TAG)
 
+    private val inviteSessionTimerPolicy = SipInviteSessionTimerPolicy(TAG)
+    private val smsFallbackPolicy = SipSmsFallbackPolicy(TAG)
     // SIP responses must be written back on the same transport flow that delivered the request.
     // This is especially important for incoming INVITE over the TCP server socket: writing the
     // 180/200 to the registration/control socket can make the P-CSCF ignore the final response.
@@ -362,6 +365,7 @@ private val smsHandler = SipSmsHandler(
         mySipProvider = { mySip },
         writerProvider = { socket.gWriter() },
         responseCallbackSetter = { callId, cb -> setResponseCallback(callId, cb) },
+        smsSipFailureListener = { smsRealm, statusCode -> smsFallbackPolicy.learnFromSipMessageFailure(smsRealm, statusCode) },
         timeoutScheduler = { delayMs, action -> myHandler.postDelayed({ action() }, delayMs) },
     )
 
@@ -546,6 +550,20 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         return keepCallback
     }
 
+    private val IWLAN_CONVERGENCE_OUTGOING_CALL_GUARD_MS = 60_000L
+
+    private fun isWaitingForIwlanAfterWfcPreferenceChange(): Boolean {
+        if (!wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly()) {
+            return false
+        }
+        if (imsRegistrationTech != REGISTRATION_TECH_LTE) {
+            return false
+        }
+
+        val elapsedMs = SystemClock.uptimeMillis() - wfcSubscriptionSettingMonitor.lastChangeUptimeMs()
+        return elapsedMs in 0L..IWLAN_CONVERGENCE_OUTGOING_CALL_GUARD_MS
+    }
+
     fun isReadyForOutgoingCall(): Boolean {
         val ready =
             imsReady &&
@@ -561,6 +579,16 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
                     "networkInitialized=${this::network.isInitialized} " +
                     "socketInitialized=${this::socket.isInitialized}",
             )
+        }
+
+        if (ready && isWaitingForIwlanAfterWfcPreferenceChange()) {
+            val elapsedMs = SystemClock.uptimeMillis() - wfcSubscriptionSettingMonitor.lastChangeUptimeMs()
+            Rlog.w(
+                TAG,
+                "Rejecting outgoing call while waiting for IWLAN IMS after WFC preference/subscription change: " +
+                    "tech=${registrationTechName(imsRegistrationTech)} elapsedMs=$elapsedMs",
+            )
+            return false
         }
 
         return ready
@@ -586,6 +614,29 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         return ImsNetworkState.detectRegistrationTech(connectivityManager, currentNetwork, lp)
     }
 
+    private fun refreshRegistrationTechFromCurrentLink(reason: String) {
+        val currentNetwork = if (this::network.isInitialized) network else null
+        val lp = currentNetwork?.let { connectivityManager.getLinkProperties(it) } ?: return
+        val newTech = detectRegistrationTech(lp)
+
+        if (newTech == imsRegistrationTech) {
+            Rlog.d(
+                TAG,
+                "IMS registration tech unchanged before $reason: " +
+                    "${registrationTechName(newTech)} interface=${lp.interfaceName}",
+            )
+            return
+        }
+
+        Rlog.d(
+            TAG,
+            "IMS registration tech changed before $reason: " +
+                "old=${registrationTechName(imsRegistrationTech)} " +
+                "new=${registrationTechName(newTech)} interface=${lp.interfaceName}",
+        )
+        imsRegistrationTech = newTech
+    }
+
     private fun resetRegistrationStateForConnect() {
         registerCounter = 1
         akaDigest = initialRegisterAuthorization()
@@ -597,6 +648,9 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         To: <sip:$user>
         """.toSipHeadersMap() + registerCallId
         commonHeaders = "".toSipHeadersMap()
+        registerTargetRealm = realm
+        registerSecurityClientOverride = null
+        selectedSecurityClientForPromotedRegister = null
         contact = ""
         mySip = ""
         myTel = ""
@@ -825,6 +879,88 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     }
 
 
+    private fun restartOutgoingMediaAfterDialogSdpCodecChange(
+        oldCall: Call?,
+        newCall: Call?,
+        reason: String,
+    ) {
+        if (oldCall == null || newCall == null || !newCall.outgoing) {
+            return
+        }
+
+        val codecChanged =
+            oldCall.audioCodec.name != newCall.audioCodec.name ||
+                oldCall.audioCodec.sampleRate != newCall.audioCodec.sampleRate ||
+                oldCall.amrTrack != newCall.amrTrack ||
+                oldCall.dtmfTrack != newCall.dtmfTrack
+
+        if (!codecChanged) {
+            return
+        }
+
+        val oldCallId = oldCall.callHeaders["call-id"]?.getOrNull(0)
+        val newCallId = newCall.callHeaders["call-id"]?.getOrNull(0)
+        if (oldCallId != newCallId) {
+            Rlog.d(
+                TAG,
+                "Ignoring outgoing dialog SDP codec change across call-id boundary: " +
+                    "reason=$reason oldCallId=$oldCallId newCallId=$newCallId",
+            )
+            return
+        }
+
+        if (!threadsStarted.get()) {
+            Rlog.d(
+                TAG,
+                "Outgoing dialog SDP changed codec before media start: reason=$reason " +
+                    "old=${oldCall.audioCodec.name}/${oldCall.audioCodec.sampleRate} pt=${oldCall.amrTrack} " +
+                    "new=${newCall.audioCodec.name}/${newCall.audioCodec.sampleRate} pt=${newCall.amrTrack}",
+            )
+            return
+        }
+
+        val newGeneration = callGeneration.incrementAndGet()
+        callStopped.set(true)
+        callStarted.set(false)
+        threadsStarted.set(false)
+
+        Rlog.w(
+            TAG,
+            "Restarting outgoing media after dialog SDP codec change: reason=$reason " +
+                "old=${oldCall.audioCodec.name}/${oldCall.audioCodec.sampleRate} pt=${oldCall.amrTrack}/${oldCall.dtmfTrack} " +
+                "new=${newCall.audioCodec.name}/${newCall.audioCodec.sampleRate} pt=${newCall.amrTrack}/${newCall.dtmfTrack} " +
+                "generation=$newGeneration",
+        )
+
+        myHandler.postDelayed({
+            val active = currentCall
+            val activeCallId = active?.callHeaders?.get("call-id")?.getOrNull(0)
+            if (active == null || activeCallId != newCallId || !active.outgoing) {
+                Rlog.w(
+                    TAG,
+                    "Skipping outgoing media restart after dialog SDP codec change; " +
+                        "activeCallId=$activeCallId expectedCallId=$newCallId activeOutgoing=${active?.outgoing}",
+                )
+                return@postDelayed
+            }
+
+            callStopped.set(false)
+            callStarted.set(false)
+            if (threadsStarted.compareAndSet(false, true)) {
+                Rlog.w(
+                    TAG,
+                    "Starting restarted outgoing media after dialog SDP codec change: " +
+                        "codec=${active.audioCodec.name}/${active.audioCodec.sampleRate} " +
+                        "pt=${active.amrTrack}/${active.dtmfTrack} generation=${callGeneration.get()}",
+                )
+                callDecodeThread()
+                callEncodeThread()
+            } else {
+                Rlog.w(TAG, "Outgoing media restart skipped; threads already restarted")
+            }
+        }, 150L)
+    }
+
     private fun hasActiveOrPendingCallForImsReconnectDeferral(): Boolean {
         val hasDialogState = currentCall != null || pendingOutgoingInvite != null
         if (hasDialogState) {
@@ -1030,10 +1166,35 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         plainSocket.close()
 
+        val registerDigestUriRealm = SipRegisterNegotiationPolicy.challengedRegistrarRealm(
+            defaultRealm = realm,
+            challengeRealm = registerChallenge.realm,
+        )
+        if (!registerDigestUriRealm.equals(realm, ignoreCase = true)) {
+            Rlog.w(
+                TAG,
+                "Using challenged REGISTER realm as request/digest URI: " +
+                    "oldUri=sip:$realm newUri=sip:$registerDigestUriRealm " +
+                    "challengeRealm=${registerChallenge.realm}",
+            )
+        }
+        registerTargetRealm = registerDigestUriRealm
+        registerSecurityClientOverride =
+            if (registerTargetRealm != realm) {
+                selectedSecurityClientForPromotedRegister?.also {
+                    Rlog.w(
+                        TAG,
+                        "Applying selected Security-Client for promoted REGISTER target: " +
+                            "defaultRealm=$realm targetRealm=$registerTargetRealm securityClient=$it",
+                    )
+                }
+            } else {
+                null
+            }
         akaDigest = SipRegistrationDigestFactory.create(
             user = user,
             realm = registerChallenge.realm,
-            uri = "sip:$realm",
+            uri = "sip:$registerDigestUriRealm",
             nonceB64 = registerChallenge.nonceB64,
             opaque = registerChallenge.opaque,
             akaResult = akaResult,
@@ -1047,6 +1208,19 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             commonHeaders += ("security-verify" to securityServer)
             registerHeaders += ("security-verify" to securityServer)
             val securityServerParams = SipSecurityServerSelector.select(securityServer).params
+                selectedSecurityClientForPromotedRegister =
+                    SipRegisterNegotiationPolicy.selectedSecurityClientHeader(
+                        securityServerParams = securityServerParams,
+                        ipsecSettings = ipsecSettings,
+                        clientPort = socket.gLocalPort(),
+                        serverPort = serverSocket.localPort,
+                    )
+
+
+            // Keep the protected REGISTER Security-Client identical to the initial
+            // Security-Client offer. Some IMS cores reject a narrowed/selected
+            // Security-Client as a bid-down attack.
+            registerSecurityClientOverride = null
 
             portS = securityServerParams["port-s"]!!.toInt()
             // spi string is 32 bit unsigned, but ipSecManager wants an int...
@@ -1449,6 +1623,12 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         registerHeaders += update.headers
         commonHeaders += update.headers
     }
+
+
+    private fun useSingTelNullSha1SecurityOffer(): Boolean =
+        realm.equals("ims.mnc001.mcc525.3gppnetwork.org", ignoreCase = true) ||
+            registerTargetRealm.equals("ims.singtel.com", ignoreCase = true)
+
     fun register(_writer: OutputStream? = null) {
         RegistrationCellInfoLogger.log(TAG, subTelephonyManager)
 
@@ -1462,7 +1642,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         val writer = _writer ?: socket.gWriter()
 
         val msg = SipRegisterRequestBuilder.build(
-            realm = realm,
+            realm = registerTargetRealm,
             registerHeaders = registerHeaders,
             registerCounter = registerCounter,
             contact = contact,
@@ -1470,6 +1650,12 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             ipsecSettings = ipsecSettings,
             clientPort = socket.gLocalPort(),
             serverPort = serverSocket.localPort,
+            securityClientOverride = registerSecurityClientOverride,
+            securityClientAlgs = if (useSingTelNullSha1SecurityOffer()) listOf("hmac-sha-1-96") else listOf("hmac-sha-1-96", "hmac-md5-96"),
+            securityClientEalgs = if (useSingTelNullSha1SecurityOffer()) listOf("null") else listOf("null", "aes-cbc"),
+            stripSecurityVerifyQ = false,
+            useSelectedSecurityClient = registerTargetRealm != realm,
+            forceSecurityAgreementNullEalg = false,
         )
         Rlog.d(TAG, "Sending $msg")
         synchronized(writer) {
@@ -1494,6 +1680,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         // REGISTER 200 OK is the actual IMS registration success.  Do not
         // block framework registration state on the optional reg-event
         // SUBSCRIBE path; some carriers answer it very late with 504.
+        refreshRegistrationTechFromCurrentLink("REGISTER 200 OK")
         markImsReady("REGISTER 200 OK")
 
         // always keep callback
@@ -1947,8 +2134,57 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         val destination: String,
         val headers: SipHeadersMap,
         val rtpSocket: DatagramSocket,
+        val body: ByteArray,
+        val retriedAfter422: AtomicBoolean = AtomicBoolean(false),
         val cancelSent: AtomicBoolean = AtomicBoolean(false),
     )
+
+
+    private fun retryOutgoingInviteAfter422(
+        pending: PendingOutgoingInvite,
+        response: SipResponse,
+        outgoingDialogNextCseq: AtomicInteger,
+    ): Boolean {
+        val retry = inviteSessionTimerPolicy.buildRetryHeadersAfter422(
+            realm = realm,
+            originalHeaders = pending.headers,
+            response = response,
+        ) ?: return false
+
+        if (!pending.retriedAfter422.compareAndSet(false, true)) {
+            Rlog.w(TAG, "Not retrying outgoing INVITE after 422 twice callId=${pending.callId}")
+            return false
+        }
+
+        val retryInvite = SipRequest(
+            SipMethod.INVITE,
+            pending.destination,
+            retry.headers,
+            pending.body,
+        )
+
+        pendingOutgoingInvite = pending.copy(headers = retryInvite.headers)
+        val desiredNextCseq = retry.cseqNumber + 1
+        while (true) {
+            val oldNextCseq = outgoingDialogNextCseq.get()
+            if (oldNextCseq >= desiredNextCseq ||
+                outgoingDialogNextCseq.compareAndSet(oldNextCseq, desiredNextCseq)
+            ) break
+        }
+
+        Rlog.w(
+            TAG,
+            "Retrying outgoing INVITE after 422 with Min-SE=${retry.minSeSeconds} " +
+                "Session-Expires=${retry.sessionExpiresSeconds} " +
+                "callId=${pending.callId} cseq=${retry.cseqNumber}",
+        )
+        val writer = socket.gWriter()
+        synchronized(writer) {
+            writer.write(retryInvite.toByteArray())
+            writer.flush()
+        }
+        return true
+    }
 
     // AMR-NB speech payload sizes in bits for FT 0..8.
     // Codec input for Android's audio/3gpp decoder is one AMR storage frame:
@@ -2123,6 +2359,8 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             while (true) {
                 if (callStopped.get() || callGeneration.get() != gen) break
                 val nRead = audioRecord.read(buffer, 0, buffer.size)
+                if (callStopped.get() || callGeneration.get() != gen) break
+                if (nRead <= 0) continue
                 if (realFrameCount < 5) {
                     val allZero = buffer.take(nRead.coerceAtLeast(0)).all { it == 0.toByte() }
                     Rlog.d(TAG, "AudioRecord.read nRead=$nRead allZero=$allZero (bufferSize=${buffer.size})")
@@ -2866,6 +3104,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
             val contactTel =
                 """<sip:$myTel@$local;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
+            val outgoingInviteSessionTimer = inviteSessionTimerPolicy.currentForRealm(realm)
             val myHeaders = commonHeaders +
                 """
                     From: <$mySip>
@@ -2878,10 +3117,10 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS
                     P-Early-Media: supported
                     Content-Type: application/sdp
-                    Session-Expires: 900
+                    Session-Expires: ${outgoingInviteSessionTimer.sessionExpiresSeconds}
                     Supported: 100rel, replaces, timer, precondition
                     Accept: application/sdp
-                    Min-SE: 90
+                    Min-SE: ${outgoingInviteSessionTimer.minSeSeconds}
                     Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
                     P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
                     Contact: $contactTel
@@ -2906,6 +3145,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 destination = to,
                 headers = msg.headers,
                 rtpSocket = rtpSocket,
+                body = sdp,
             )
             val prackedReliableProvisionals = mutableSetOf<String>()
             setResponseCallback(outgoingInviteCallId) { r: SipResponse ->
@@ -3079,6 +3319,13 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     }
 
                     if(resp.statusCode >= 400) {
+                        val failedPendingInvite = pendingOutgoingInvite
+                        if (failedPendingInvite != null &&
+                            failedPendingInvite.callId == resp.callIdOrEmpty() &&
+                            retryOutgoingInviteAfter422(failedPendingInvite, resp, outgoingDialogNextCseq)
+                        ) {
+                            return@setResponseCallback false
+                        }
                         val failedCallId = resp.callIdOrEmpty()
                         val failedCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
                         val activeCallId = currentCall?.callIdOrNull()
@@ -3247,6 +3494,11 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     outgoingDialogNextCseq.get(),
                     currentCall?.localCseq?.get() ?: 0,
                 )
+                // PhhIms: final INVITE SDP media restart.
+                // Keep the media state selected by a provisional 183 before replacing
+                // currentCall with the later/final SDP answer. Some IMS cores answer
+                // 183 with AMR-NB and then switch the confirmed 200 OK to AMR-WB.
+                val previousOutgoingDialogCall = currentCall
                 currentCall = Call(
                     outgoing = true,
                     audioCodec = dialogAudioCodec,
@@ -3269,6 +3521,11 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     remoteContact = extractDestinationFromContact(resp.headers["contact"]!![0]),
                     localCseq = AtomicInteger(nextLocalCseqForDialog),
                 )
+                restartOutgoingMediaAfterDialogSdpCodecChange(
+                    previousOutgoingDialogCall,
+                    currentCall,
+                    "status=${resp.statusCode} cseq=${resp.headers["cseq"]?.getOrNull(0).orEmpty()}",
+                )
                 val responseCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
                 val outgoingDialogPhase = when {
                     responseCseq.contains("UPDATE") -> "update"
@@ -3285,6 +3542,30 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                         "route=${currentCall?.callHeaders?.get("route")}",
                 )
 
+                val outgoingMediaFormatChanged =
+                    threadsStarted.get() &&
+                        previousOutgoingDialogCall != null &&
+                        responseCseq.contains("INVITE") &&
+                        (resp.statusCode == 200 || resp.statusCode == 202) &&
+                        (
+                            previousOutgoingDialogCall.audioCodec != dialogAudioCodec ||
+                                previousOutgoingDialogCall.amrTrack != dialogAmrTrack ||
+                                previousOutgoingDialogCall.dtmfTrack != dialogDtmfTrack ||
+                                previousOutgoingDialogCall.rtpRemoteAddr != rtpRemoteAddr ||
+                                previousOutgoingDialogCall.rtpRemotePort != rtpRemotePortInt
+                        )
+                if (outgoingMediaFormatChanged) {
+                    Rlog.w(
+                        TAG,
+                        "Outgoing final INVITE SDP changed running media format: " +
+                            "oldCodec=${previousOutgoingDialogCall?.audioCodec?.name}/${previousOutgoingDialogCall?.audioCodec?.sampleRate} " +
+                            "oldAmr=${previousOutgoingDialogCall?.amrTrack} oldDtmf=${previousOutgoingDialogCall?.dtmfTrack} " +
+                            "oldRtp=${previousOutgoingDialogCall?.rtpRemoteAddr}:${previousOutgoingDialogCall?.rtpRemotePort} " +
+                            "newCodec=${dialogAudioCodec.name}/${dialogAudioCodec.sampleRate} " +
+                            "newAmr=$dialogAmrTrack newDtmf=$dialogDtmfTrack " +
+                            "newRtp=$rtpRemoteAddr:$rtpRemotePortInt",
+                    )
+                }
                 if (responseCseq.contains("INVITE") && (resp.statusCode == 200 || resp.statusCode == 202)) {
                     val finalInviteCallId = resp.callIdOrEmpty()
                     val finalInviteAfterLocalCancel = pendingOutgoingInvite?.callId == finalInviteCallId &&
@@ -3300,6 +3581,17 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     clearPendingOutgoingInvite(finalInviteCallId, closeRtpSocket = false, reason = "final INVITE answer")
                     if (threadsStarted.compareAndSet(false, true)) {
                         Rlog.d(TAG, "Starting outgoing media threads from final INVITE SDP")
+                        callDecodeThread()
+                        callEncodeThread()
+                    } else if (outgoingMediaFormatChanged) {
+                        val mediaRestartGeneration = callGeneration.incrementAndGet()
+                        Rlog.w(
+                            TAG,
+                            "Restarting outgoing media threads after final INVITE SDP media change: " +
+                                "generation=$mediaRestartGeneration " +
+                                "codec=${dialogAudioCodec.name}/${dialogAudioCodec.sampleRate} " +
+                                "amrTrack=$dialogAmrTrack dtmfTrack=$dialogDtmfTrack",
+                        )
                         callDecodeThread()
                         callEncodeThread()
                     } else {
@@ -3498,6 +3790,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 Rlog.w(TAG, "Unexpected RTP receive failure; exiting decode thread", t)
                 break
             }
+            if (callStopped.get() || callGeneration.get() != gen) break
             receivedCount++
             if (receiveCall.outgoing) {
                 if (callStarted.get()) {
@@ -4204,6 +4497,11 @@ Content-Length: 0
         successCb: (() -> Unit),
         failCb: (() -> Unit),
     ) {
+        if (smsFallbackPolicy.shouldBypass(realm)) {
+            Rlog.w(TAG, "IMS SMS learned fallback: returning framework fallback without SIP MESSAGE")
+            failCb()
+            return
+        }
         smsHandler.sendSms(smsSmsc, pdu, ref, successCb, failCb)
     }
 
