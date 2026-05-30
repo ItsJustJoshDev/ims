@@ -1,60 +1,129 @@
-name: Build PhhIms
+name: Build PhhIms + Magisk Module
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-  pull_request:
+workflow_dispatch:
+push:
+branches:
+- main
+pull_request:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+build:
+runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
+steps:
+  - name: Checkout source
+    uses: actions/checkout@v4
+    with:
+      submodules: recursive
 
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+  - name: Setup Java 21
+    uses: actions/setup-java@v4
+    with:
+      distribution: temurin
+      java-version: '21'
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
+  - name: Validate Gradle Wrapper
+    uses: gradle/wrapper-validation-action@v3
 
-      - name: Validate Gradle Wrapper
-        uses: gradle/wrapper-validation-action@v3
+  - name: Download Android 16 QPR2 Framework Jars
+    run: |
+      mkdir -p framework_jars
 
-      - name: Download Android 16 QPR2 framework jar
-        run: |
-          mkdir -p app/libs
-          curl -L \
-            https://github.com/ItsJustJoshDev/ims/releases/download/android16-qpr2/android.jar \
-            -o app/libs/android.jar
+      curl -L -o framework_jars/framework.jar \
+        https://github.com/ItsJustJoshDev/ims/releases/download/android16-qpr2/framework.jar
 
-      - name: Verify android.jar
-        run: |
-          ls -lah app/libs/
-          file app/libs/android.jar || true
-          jar tf app/libs/android.jar | head -20
+      curl -L -o framework_jars/framework-minus-apex.jar \
+        https://github.com/ItsJustJoshDev/ims/releases/download/android16-qpr2/framework-minus-apex.jar
 
-      - name: Make Gradle executable
-        run: chmod +x gradlew
+      curl -L -o framework_jars/telephony-common.jar \
+        https://github.com/ItsJustJoshDev/ims/releases/download/android16-qpr2/telephony-common.jar
 
-      - name: Build Debug
-        run: ./gradlew assembleDebug --stacktrace
+      curl -L -o framework_jars/ims-common.jar \
+        https://github.com/ItsJustJoshDev/ims/releases/download/android16-qpr2/ims-common.jar
 
-      - name: Build Release
-        run: ./gradlew assembleRelease --stacktrace
+      curl -L -o framework_jars/telecom.jar \
+        https://github.com/ItsJustJoshDev/ims/releases/download/android16-qpr2/telecom.jar
 
-      - name: Upload APKs
-        uses: actions/upload-artifact@v4
-        with:
-          name: PhhIms-APKs
-          path: |
-            **/build/outputs/apk/**/*.apk
-          if-no-files-found: error
+  - name: Build merged android.jar
+    run: |
+      mkdir -p app/libs
+      mkdir merged
+
+      cd merged
+
+      jar xf ../framework_jars/framework.jar || true
+      jar xf ../framework_jars/framework-minus-apex.jar || true
+      jar xf ../framework_jars/telephony-common.jar || true
+      jar xf ../framework_jars/ims-common.jar || true
+      jar xf ../framework_jars/telecom.jar || true
+
+      jar cf ../app/libs/android.jar .
+
+  - name: Verify merged android.jar
+    run: |
+      ls -lh app/libs/android.jar
+      jar tf app/libs/android.jar | grep "android/telephony/ims" | head -20 || true
+      jar tf app/libs/android.jar | grep "Rlog" | head -20 || true
+
+  - name: Grant execute permission
+    run: chmod +x gradlew
+
+  - name: Build Release APK
+    run: ./gradlew assembleRelease --stacktrace
+
+  - name: Locate APK
+    id: apk
+    run: |
+      APK=$(find . -path "*/build/outputs/apk/*release/*.apk" | head -n1)
+      echo "apk=$APK" >> $GITHUB_OUTPUT
+      echo "Found APK: $APK"
+
+  - name: Create Magisk Module
+    run: |
+      mkdir -p module/system_ext/priv-app/PhhIms
+      mkdir -p module/system/etc/permissions
+
+      cp "${{ steps.apk.outputs.apk }}" \
+        module/system_ext/priv-app/PhhIms/PhhIms.apk
+
+      cat > module/module.prop << 'EOF'
+      id=phhims
+      name=Phh IMS
+      version=1.0
+      versionCode=1
+      author=ItsJustJoshDev
+      description=Open-source IMS implementation for Android 16
+      EOF
+
+      cat > module/customize.sh << 'EOF'
+      SKIPMOUNT=false
+      PROPFILE=true
+      POSTFSDATA=false
+      LATESTARTSERVICE=false
+      EOF
+
+      cat > module/system/etc/permissions/privapp-permissions-me.phh.ims.xml << 'EOF'
+      <?xml version="1.0" encoding="utf-8"?>
+      <permissions>
+          <privapp-permissions package="me.phh.ims">
+              <permission name="android.permission.READ_PRIVILEGED_PHONE_STATE"/>
+              <permission name="android.permission.MODIFY_PHONE_STATE"/>
+          </privapp-permissions>
+      </permissions>
+      EOF
+
+      cd module
+      zip -r ../PhhIms-Magisk.zip .
+
+  - name: Upload APK
+    uses: actions/upload-artifact@v4
+    with:
+      name: PhhIms-APK
+      path: ${{ steps.apk.outputs.apk }}
+
+  - name: Upload Magisk Module
+    uses: actions/upload-artifact@v4
+    with:
+      name: PhhIms-Magisk
+      path: PhhIms-Magisk.zip
